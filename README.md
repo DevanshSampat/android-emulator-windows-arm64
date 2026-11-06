@@ -27,8 +27,8 @@ Controls, and guest vsync that follows the host monitor's refresh rate.
 - There is no audio device yet.
 - Video uses software decoders in the guest, so high resolutions depend on the host CPU.
 - The 4K TV AVD renders at about 14 fps.
-- Refresh rate follows the monitor, but guest rendering decides real smoothness: about 40 to 50 fps
-  while scrolling on a phone AVD.
+- Scrolling on a phone AVD reaches about 80 to 90 fps on a 120 Hz monitor. Each frame takes about
+  10 ms to render, and a steady 120 fps needs 8.3 ms.
 - An intermittent freeze was seen on Android 13 and could not be reproduced on demand: a reply to
   the graphics allocator goes missing and the display stops. See `docs/`.
 - Tested on one Snapdragon X machine so far.
