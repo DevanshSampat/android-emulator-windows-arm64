@@ -66,7 +66,7 @@ for d in ('com', 'patched', 'patched_p33', 'python', 'modules_whpx_5_15', 'modul
 # Version Google's SDK repository will never reach, so Studio never offers to replace this.
 p = os.path.join(dst, 'package.xml')
 s = open(p, encoding='utf8').read()
-s, n = re.subn(r'<major>37</major>\s*<minor>2</minor>\s*<micro>13</micro>', '<major>99</major><minor>0</minor><micro>0</micro>', s, count=1)
+s, n = re.subn(r'<major>\d+</major>\s*<minor>\d+</minor>\s*<micro>\d+</micro>', '<major>99</major><minor>0</minor><micro>0</micro>', s, count=1)
 assert n == 1
 s, n = re.subn(r'<display-name>[^<]*</display-name>', '<display-name>Android Emulator (Windows ARM64, WHPX)</display-name>', s, count=1)
 assert n == 1
