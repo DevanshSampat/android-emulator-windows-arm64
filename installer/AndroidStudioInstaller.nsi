@@ -2,7 +2,7 @@
 ; Android Studio 2026.2.1 (Windows ARM64) NSIS Setup Script
 ; Built for Windows on ARM (Snapdragon X Elite / X Plus / ARM64 PCs)
 ; Includes Native ARM64 Layoutlib & Compose Previews Pre-Configured
-; Full Official Windows App & Start Menu Search Integration
+; Unofficial, independent build. Not affiliated with Google.
 ; Includes the Windows ARM64 Android Emulator (WHPX)
 ; ============================================================================
 
@@ -12,7 +12,7 @@
 
 ; General Configuration
 Name "Android Studio"
-Caption "Android Studio 2026.2.1 (ARM64 Windows) Setup"
+Caption "Android Studio 2026.2.1 for Windows ARM64 (Unofficial) Setup"
 OutFile "AndroidStudio-2026.2.1-Windows-ARM64-Setup.exe"
 InstallDir "$PROGRAMFILES64\Android\Android Studio"
 InstallDirRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\App Paths\studio64.exe" "Path"
@@ -37,8 +37,8 @@ SetCompressor /SOLID zlib
 ; Wizard Pages
 ; ============================================================================
 ; Welcome page
-!define MUI_WELCOMEPAGE_TITLE "Welcome to Android Studio Setup (Windows ARM64)"
-!define MUI_WELCOMEPAGE_TEXT "This wizard will install Android Studio 2026.2.1 compiled and optimized for Windows on ARM (Snapdragon X Elite / X Plus).\r\n\r\nFeatures pre-installed native ARM64 Layoutlib and Jetpack Compose renderers with zero emulation overhead!\r\n\r\nClick Next to continue."
+!define MUI_WELCOMEPAGE_TITLE "Android Studio Setup for Windows ARM64 (Unofficial)"
+!define MUI_WELCOMEPAGE_TEXT "This wizard installs an unofficial, independent Windows ARM64 build of Android Studio 2026.2.1 and an Android Emulator.$\r$\n$\r$\nThis project is not made, endorsed or supported by Google."
 !insertmacro MUI_PAGE_WELCOME
 
 ; License page
@@ -240,7 +240,7 @@ Section "Android Studio Core" SecCore
   ; 4. Windows Application Capabilities & RegisteredApplications
   ; ==========================================================================
   WriteRegStr HKLM "SOFTWARE\Classes\Applications\studio64.exe" "FriendlyAppName" "Android Studio"
-  WriteRegStr HKLM "SOFTWARE\Classes\Applications\studio64.exe" "ApplicationCompany" "Google LLC"
+  WriteRegStr HKLM "SOFTWARE\Classes\Applications\studio64.exe" "ApplicationCompany" "Devansh Sampat"
   WriteRegStr HKLM "SOFTWARE\Classes\Applications\studio64.exe\DefaultIcon" "" "$INSTDIR\bin\studio.ico,0"
   WriteRegStr HKLM "SOFTWARE\Classes\Applications\studio64.exe\shell\open\command" "" '"$INSTDIR\bin\studio64.exe" "%1"'
   
@@ -254,7 +254,7 @@ Section "Android Studio Core" SecCore
   ; ==========================================================================
   WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\AndroidStudioARM64" "DisplayName" "Android Studio"
   WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\AndroidStudioARM64" "DisplayVersion" "2026.2.1"
-  WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\AndroidStudioARM64" "Publisher" "Google LLC"
+  WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\AndroidStudioARM64" "Publisher" "Devansh Sampat"
   WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\AndroidStudioARM64" "DisplayIcon" "$INSTDIR\bin\studio.ico,0"
   WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\AndroidStudioARM64" "UninstallString" '"$INSTDIR\uninstall.exe"'
   WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\AndroidStudioARM64" "InstallLocation" "$INSTDIR"
