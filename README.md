@@ -30,7 +30,7 @@ Controls, and guest vsync that follows the host monitor's refresh rate.
 - Scrolling on a phone AVD reaches about 80 to 90 fps on a 120 Hz monitor. Each frame takes about
   10 ms to render, and a steady 120 fps needs 8.3 ms.
 - An intermittent freeze was seen on Android 13 and could not be reproduced on demand: a reply to
-  the graphics allocator goes missing and the display stops. See `docs/`.
+  the graphics allocator goes missing and the display stops. See `docs/ARCHITECTURE.md`.
 - Tested on one Snapdragon X machine so far.
 
 ## How it works
@@ -51,7 +51,7 @@ Renderer (GfxstreamPipeServer + gfxstream) <---- TCP through slirp --- gfx_forwa
 | `guest/` | `whpx_init` (first-stage init), GL forwarder, address-space stubs, agents, boot scripts |
 | `image-tools/` | Builds the per-image ramdisk and patches stock vendor binaries at first boot |
 | `installer/` | Assembles the distributable emulator and the NSIS installer |
-| `docs/` | Design notes |
+| `docs/` | Architecture |
 
 Stock images expect goldfish devices that do not exist here. At first boot, `gfx_autopatch.py`
 retargets those paths in the image's vendor binaries, and the result is cached per image.
