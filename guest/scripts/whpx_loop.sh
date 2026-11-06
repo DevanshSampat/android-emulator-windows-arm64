@@ -250,6 +250,26 @@ while true; do
       fi
     fi
 
+    # Android caps app rendering at 60 fps whatever the panel runs at, until these are set.
+    # Phones and tablets only: TV and watch UIs gain nothing and video would pay for it.
+    if [ -z "$rate_done" ]; then
+      # ro.build.characteristics says "emulator" even on TV images, so ask the package manager.
+      features=$(pm list features 2>/dev/null)
+      hz=$(getprop ro.boot.qemu.vsync)
+      case "$features" in
+        "") ;;
+        *leanback*|*hardware.type.watch*) rate_done=1 ;;
+        *)
+          if [ -z "$hz" ] || [ "$(settings get system peak_refresh_rate 2>/dev/null)" = "$hz" ]; then
+            rate_done=1
+          else
+            settings put system peak_refresh_rate "$hz" 2>/dev/null
+            settings put system min_refresh_rate "$hz" 2>/dev/null
+          fi
+          ;;
+      esac
+    fi
+
     # Images ship a framework and a SystemUI overlay per Pixel skin with its real cutout and
     # corners, which the stock emulator enables. Without them a skin with a cutout falls back to
     # emu01, an inset that draws nothing: "hole" would add a black circle at the top left.

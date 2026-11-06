@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System;
 using System.Collections.Concurrent;
 using System.IO;
@@ -252,6 +253,41 @@ class GfxstreamPipeServer {
     // Ops are seen before the renderer runs them, and the buffers are reused in a cycle, so a
     // read that starts at once can return the frame that buffer held last time round.
     const int ComposeSettleMs = 5;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct PowerThrottlingState { public uint Version, ControlMask, StateMask; }
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetProcessInformation(IntPtr process, int infoClass, ref PowerThrottlingState state, uint size);
+    const int ProcessPowerThrottling = 4;
+    const uint ThrottleExecutionSpeed = 1, ThrottleIgnoreTimerResolution = 4;
+
+    // These processes have no window, so Windows treats them as background work: efficiency
+    // scheduling, and timer resolution requests ignored. On battery that took Settings from
+    // 4% to 33% janky frames, so opt out of both for as long as the emulator runs.
+    static void KeepEmulatorForeground(System.Diagnostics.Process p, bool raisePriority) {
+        PowerThrottlingState state = new PowerThrottlingState {
+            Version = 1, ControlMask = ThrottleExecutionSpeed | ThrottleIgnoreTimerResolution, StateMask = 0 };
+        SetProcessInformation(p.Handle, ProcessPowerThrottling, ref state, 12);
+        if (raisePriority) p.PriorityClass = System.Diagnostics.ProcessPriorityClass.AboveNormal;
+    }
+
+    static void ForegroundLoop(int bridgePid) {
+        HashSet<int> done = new HashSet<int>();
+        while (true) {
+            try {
+                List<System.Diagnostics.Process> ps = new List<System.Diagnostics.Process>();
+                ps.Add(System.Diagnostics.Process.GetCurrentProcess());
+                ps.AddRange(System.Diagnostics.Process.GetProcessesByName("qemu-system-aarch64"));
+                foreach (System.Diagnostics.Process p in ps) {
+                    if (done.Add(p.Id)) KeepEmulatorForeground(p, true);
+                }
+                if (bridgePid > 0 && done.Add(bridgePid)) {
+                    KeepEmulatorForeground(System.Diagnostics.Process.GetProcessById(bridgePid), false);
+                }
+            } catch (Exception ex) { Console.WriteLine("[Foreground] " + ex.Message); }
+            Thread.Sleep(3000);
+        }
+    }
     static long lastComposeStamp = 0;
     static volatile int lastComposeTick = 0;
     static volatile bool hasSeenRealDisplayPost = false;
@@ -1285,8 +1321,11 @@ class GfxstreamPipeServer {
         if (args.Length >= 3) int.TryParse(args[2], out port);
         if (args.Length >= 4) frameOutputPath = args[3];
         // There is no machine-wide cleanup any more, so never outlive the bridge.
-        int parentPid;
-        if (args.Length >= 5 && int.TryParse(args[4], out parentPid)) {
+        int parentPid = 0;
+        bool hasParent = args.Length >= 5 && int.TryParse(args[4], out parentPid);
+        int bridgePid = parentPid;
+        new Thread(() => ForegroundLoop(bridgePid)) { IsBackground = true }.Start();
+        if (hasParent) {
             Thread parentWatch = new Thread(() => {
                 while (true) {
                     Thread.Sleep(2000);
