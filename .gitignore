@@ -1,0 +1,10 @@
+*.class
+*.exe
+*.dll
+*.log
+*.dat
+*.bak*
+__pycache__/
+whpx_init
+whpx_daemon
+gfx_forwarder
