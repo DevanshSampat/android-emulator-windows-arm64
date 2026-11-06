@@ -71,6 +71,14 @@ SetCompressor /SOLID zlib
 Function .onInit
   SetShellVarContext all
   SetRegView 64
+  ; The remembered location is the App Paths "Path" value, which is <install>\bin, and an
+  ; install made from that value is one level deeper still. Always start from the root.
+  rootLoop:
+    ${GetFileName} "$INSTDIR" $0
+    StrCmp $0 "bin" 0 rootDone
+    ${GetParent} "$INSTDIR" $INSTDIR
+    Goto rootLoop
+  rootDone:
 FunctionEnd
 
 Function un.onInit
@@ -89,6 +97,22 @@ Section "Android Studio Core" SecCore
   
   SetOutPath "$INSTDIR"
   
+  ; Remove the copy earlier installers nested in bin when installing over an existing Studio.
+  ${If} ${FileExists} "$INSTDIR\bin\bin\studio64.exe"
+    DetailPrint "Removing nested installation..."
+    RMDir /r "$INSTDIR\bin\bin"
+    RMDir /r "$INSTDIR\bin\jbr"
+    RMDir /r "$INSTDIR\bin\lib"
+    RMDir /r "$INSTDIR\bin\license"
+    RMDir /r "$INSTDIR\bin\modules"
+    RMDir /r "$INSTDIR\bin\plugins"
+    Delete "$INSTDIR\bin\uninstall.exe"
+    Delete "$INSTDIR\bin\LICENSE.txt"
+    Delete "$INSTDIR\bin\NOTICE.txt"
+    Delete "$INSTDIR\bin\build.txt"
+    Delete "$INSTDIR\bin\product-info.json"
+  ${EndIf}
+
   ; Write uninstaller binary into target installation directory
   WriteUninstaller "$INSTDIR\uninstall.exe"
   
@@ -100,6 +124,7 @@ Section "Android Studio Core" SecCore
   File "arm64_7z/7z.dll"
   File "studio.7z"
   File "emulator.7z"
+  File "skins.7z"
   SetCompress auto
   
   DetailPrint "Extracting Android Studio 2026.2.1 ARM64 distribution..."
@@ -125,6 +150,22 @@ Section "Android Studio Core" SecCore
   ${If} $0 != 0
     MessageBox MB_OK|MB_ICONSTOP "Android Emulator extraction failed with exit code $0."
     Abort
+  ${EndIf}
+  SetShellVarContext all
+
+  ; Device frames. Studio's WebP decoder is x64 only and cannot load on ARM64, so the skins it
+  ; copies into the SDK are shipped as PNG data. Skins already in an SDK are repaired too.
+  DetailPrint "Installing device frames..."
+  nsExec::ExecToLog '"$PLUGINSDIR\7z.exe" x -y -o"$INSTDIR\plugins\android\resources\device-art-resources" "$PLUGINSDIR\skins.7z"'
+  Pop $0
+  ${If} $0 != 0
+    MessageBox MB_OK|MB_ICONSTOP "Device frame extraction failed with exit code $0."
+    Abort
+  ${EndIf}
+  SetShellVarContext current
+  ${If} ${FileExists} "${SDK_ROOT}\skins\*.*"
+    nsExec::ExecToLog '"$PLUGINSDIR\7z.exe" x -y -o"${SDK_ROOT}\skins" "$PLUGINSDIR\skins.7z"'
+    Pop $0
   ${EndIf}
   SetShellVarContext all
 
@@ -270,6 +311,7 @@ Section "Uninstall"
   RMDir /r "$INSTDIR\jbr"
   RMDir /r "$INSTDIR\lib"
   RMDir /r "$INSTDIR\license"
+  RMDir /r "$INSTDIR\modules"
   RMDir /r "$INSTDIR\plugins"
   Delete "$INSTDIR\LICENSE.txt"
   Delete "$INSTDIR\NOTICE.txt"
