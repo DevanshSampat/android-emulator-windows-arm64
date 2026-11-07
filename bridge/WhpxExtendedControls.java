@@ -151,8 +151,46 @@ final class WhpxExtendedControls {
         frame.setLocation(x, y);
     }
 
+    /**
+     * Android Studio's icon, from bin\studio.ico of the Studio whose runtime runs the bridge.
+     * Without it the window shows the runtime's default, which is the IntelliJ logo. Java cannot
+     * read .ico files, but the 256 px entry is stored as PNG, so that one is decoded and scaled
+     * down for the title bar and taskbar. Empty if anything is missing.
+     */
+    static java.util.List<java.awt.Image> studioIcons() {
+        java.util.List<java.awt.Image> out = new java.util.ArrayList<>();
+        try {
+            File ico = new File(new File(System.getProperty("java.home")).getParentFile(), "bin" + File.separator + "studio.ico");
+            byte[] d = java.nio.file.Files.readAllBytes(ico.toPath());
+            java.nio.ByteBuffer b = java.nio.ByteBuffer.wrap(d).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            int count = b.getShort(4) & 0xFFFF;
+            java.awt.image.BufferedImage big = null;
+            for (int i = 0; i < count && big == null; i++) {
+                int size = b.getInt(6 + 16 * i + 8), off = b.getInt(6 + 16 * i + 12);
+                if (off < 0 || size <= 8 || off + size > d.length || (d[off] & 0xFF) != 0x89 || d[off + 1] != 'P') continue;
+                big = javax.imageio.ImageIO.read(new java.io.ByteArrayInputStream(d, off, size));
+            }
+            if (big == null) return out;
+            out.add(big);
+            for (int px : new int[] { 64, 48, 32, 24, 20, 16 }) {
+                java.awt.image.BufferedImage s = new java.awt.image.BufferedImage(px, px, java.awt.image.BufferedImage.TYPE_INT_ARGB);
+                java.awt.Graphics2D g = s.createGraphics();
+                g.setRenderingHint(java.awt.RenderingHints.KEY_INTERPOLATION, java.awt.RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+                g.setRenderingHint(java.awt.RenderingHints.KEY_RENDERING, java.awt.RenderingHints.VALUE_RENDER_QUALITY);
+                g.drawImage(big.getScaledInstance(px, px, java.awt.Image.SCALE_AREA_AVERAGING), 0, 0, null);
+                g.dispose();
+                out.add(s);
+            }
+        } catch (Exception | Error ignored) {
+            out.clear();
+        }
+        return out;
+    }
+
     private void build() {
         frame = new JFrame("Extended controls - " + host.avdName());
+        java.util.List<java.awt.Image> icons = studioIcons();
+        if (!icons.isEmpty()) frame.setIconImages(icons);
         frame.setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
         frame.addWindowListener(new WindowAdapter() {
             @Override
