@@ -2391,15 +2391,15 @@ public class WhpxEmulatorBridge {
 
 
 
-                "settings put global window_animation_scale 0.5; " +
+                "settings put global window_animation_scale 1.0; " +
 
 
 
-                "settings put global transition_animation_scale 0.5; " +
+                "settings put global transition_animation_scale 1.0; " +
 
 
 
-                "settings put global animator_duration_scale 0.5; " +
+                "settings put global animator_duration_scale 1.0; " +
 
 
 
@@ -4872,6 +4872,44 @@ public class WhpxEmulatorBridge {
 
 
 
+    // Measurement only: once a second, writes stream stats to %TEMP%\whpx_stream_perf.log
+    // while the file %TEMP%\whpx_perf_bridge exists. Otherwise it costs one clock read per frame.
+    private static final java.io.File SP_FLAG = new java.io.File(System.getProperty("java.io.tmpdir"), "whpx_perf_bridge");
+    private static final java.io.File SP_OUT = new java.io.File(System.getProperty("java.io.tmpdir"), "whpx_stream_perf.log");
+    private static final Object SP_LOCK = new Object();
+    private static volatile boolean spOn;
+    private static long spCheck, spWin, spLast, spBuild, spSend, spBuildMax, spSendMax, spGapMax;
+    private static int spPush, spSrc0;
+
+    private static void pushFrame(ImageFormat req, StreamObserver<Image> resp, int seq) {
+        long t0 = System.nanoTime();
+        if (t0 - spCheck > 1000000000L) { spCheck = t0; spOn = SP_FLAG.exists(); }
+        if (!spOn) { resp.onNext(buildScreenImage(req, seq)); return; }
+        Image img = buildScreenImage(req, seq);
+        long t1 = System.nanoTime();
+        resp.onNext(img);
+        long t2 = System.nanoTime();
+        synchronized (SP_LOCK) {
+            int src = frameMbb != null ? frameMbb.getInt(0) : 0;
+            if (spWin == 0) { spWin = t0; spSrc0 = src; }
+            spPush++;
+            spBuild += t1 - t0; spBuildMax = Math.max(spBuildMax, t1 - t0);
+            spSend += t2 - t1; spSendMax = Math.max(spSendMax, t2 - t1);
+            if (spLast != 0) spGapMax = Math.max(spGapMax, t0 - spLast);
+            spLast = t0;
+            if (t2 - spWin >= 1000000000L) {
+                String line = String.format(java.util.Locale.ROOT,
+                    "%tT pushed=%d rendered=%d build=%.2f/%.2fms send=%.2f/%.2fms gapMax=%.1fms size=%dx%d fmt=%s bytes=%d heapMB=%d%n",
+                    new java.util.Date(), spPush, src - spSrc0, spBuild / 1e6 / spPush, spBuildMax / 1e6,
+                    spSend / 1e6 / spPush, spSendMax / 1e6, spGapMax / 1e6, img.getWidth(), img.getHeight(),
+                    req.getFormat(), img.getImage().size(),
+                    (Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()) >> 20);
+                try (java.io.FileWriter fw = new java.io.FileWriter(SP_OUT, true)) { fw.write(line); } catch (Exception ignored) {}
+                spWin = 0; spPush = 0; spBuild = spSend = spBuildMax = spSendMax = spGapMax = 0;
+            }
+        }
+    }
+
     private static Image buildScreenImage(ImageFormat req, int seq) {
 
         if (frameMbb == null) initFrameMbb();
@@ -5866,7 +5904,7 @@ public class WhpxEmulatorBridge {
 
 
 
-                            resp.onNext(buildScreenImage(req, seq++));
+                            pushFrame(req, resp, seq++);
 
 
 
@@ -5882,7 +5920,7 @@ public class WhpxEmulatorBridge {
 
 
 
-                            resp.onNext(buildScreenImage(req, seq++));
+                            pushFrame(req, resp, seq++);
 
 
 
@@ -5906,7 +5944,7 @@ public class WhpxEmulatorBridge {
 
 
 
-                            resp.onNext(buildScreenImage(req, seq++));
+                            pushFrame(req, resp, seq++);
 
 
 
@@ -7608,6 +7646,8 @@ public class WhpxEmulatorBridge {
 
 
 
+            pointerX = x;
+            pointerY = y;
             boolean isDown = (req.getButtons() & 1) != 0;
 
 
@@ -7992,6 +8032,10 @@ public class WhpxEmulatorBridge {
 
 
 
+        // Last pointer position from Studio, including hover, so wheel scrolls land under the cursor.
+        private static volatile int pointerX = -1;
+        private static volatile int pointerY = -1;
+
         private static void handleWheelEvent(WheelEvent req) {
 
 
@@ -8000,35 +8044,15 @@ public class WhpxEmulatorBridge {
 
 
 
+            int dx = req.getDx();
             int dy = req.getDy();
-
-
-
-            if (dy == 0) return;
-
-
-
-            int cx = lcdWidth / 2;
-
-
-
-            int cy = lcdHeight / 2;
-
-
-
-            int endY = dy > 0 ? Math.min(lcdHeight - 100, cy + 400) : Math.max(100, cy - 400);
-
-
-
-            sendDirectInput("T 0 " + cx + " " + cy);
-
-
-
-            sendDirectInput("T 2 " + cx + " " + endY);
-
-
-
-            sendDirectInput("T 1 " + cx + " " + endY);
+            if (dx == 0 && dy == 0) return;
+            // Studio scales 120 to one wheel notch; touchpads send fractions of that.
+            // Android's AXIS_VSCROLL is positive for wheel-away (scroll up) like dy, and
+            // AXIS_HSCROLL is positive for scrolling right, which is the opposite of dx.
+            int x = pointerX >= 0 ? pointerX : lcdWidth / 2;
+            int y = pointerY >= 0 ? pointerY : lcdHeight / 2;
+            sendDirectInput("W " + x + " " + y + " " + (dy / 120f) + " " + (-dx / 120f));
 
 
 

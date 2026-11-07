@@ -19,6 +19,41 @@ public class WhpxInputDaemon {
     private static final int SOURCE_TOUCHSCREEN = 0x00001002;
     private static final int SOURCE_KEYBOARD = 0x00000101;
     private static final int INJECT_MODE_ASYNC = 0;
+    private static final int SOURCE_MOUSE = 0x00002002;
+
+    // Mouse wheel / touchpad scroll: a real ACTION_SCROLL at the pointer, as a USB mouse produces.
+    private static Method obtainFull;
+    private static Method setAxisValue;
+    private static Class<?> propsCls;
+    private static Class<?> coordsCls;
+
+    private static void injectScroll(float x, float y, float vscroll, float hscroll, long now) throws Exception {
+        if (obtainFull == null) {
+            propsCls = Class.forName("android.view.MotionEvent$PointerProperties");
+            coordsCls = Class.forName("android.view.MotionEvent$PointerCoords");
+            setAxisValue = coordsCls.getMethod("setAxisValue", int.class, float.class);
+            obtainFull = Class.forName("android.view.MotionEvent").getMethod("obtain",
+                    long.class, long.class, int.class, int.class,
+                    java.lang.reflect.Array.newInstance(propsCls, 0).getClass(),
+                    java.lang.reflect.Array.newInstance(coordsCls, 0).getClass(),
+                    int.class, int.class, float.class, float.class, int.class, int.class, int.class, int.class);
+        }
+        Object props = propsCls.newInstance();
+        propsCls.getField("id").setInt(props, 0);
+        propsCls.getField("toolType").setInt(props, 3); // TOOL_TYPE_MOUSE
+        Object coords = coordsCls.newInstance();
+        coordsCls.getField("x").setFloat(coords, x);
+        coordsCls.getField("y").setFloat(coords, y);
+        setAxisValue.invoke(coords, 9, vscroll);  // AXIS_VSCROLL
+        setAxisValue.invoke(coords, 10, hscroll); // AXIS_HSCROLL
+        Object pa = java.lang.reflect.Array.newInstance(propsCls, 1);
+        java.lang.reflect.Array.set(pa, 0, props);
+        Object ca = java.lang.reflect.Array.newInstance(coordsCls, 1);
+        java.lang.reflect.Array.set(ca, 0, coords);
+        Object ev = obtainFull.invoke(null, now, now, 8 /* ACTION_SCROLL */, 1, pa, ca,
+                0, 0, 1.0f, 1.0f, 0, 0, SOURCE_MOUSE, 0);
+        injectSafely(ev, INJECT_MODE_ASYNC);
+    }
 
     private static volatile long downTime = 0L;
     private static final ConcurrentHashMap<Integer, Long> keyTimes = new ConcurrentHashMap<>();
@@ -223,6 +258,9 @@ public class WhpxInputDaemon {
                 if (action == 1) {
                     downTime = 0L;
                 }
+            } else if ("W".equals(cmd) && parts.length >= 5) {
+                injectScroll(Float.parseFloat(parts[1]), Float.parseFloat(parts[2]),
+                        Float.parseFloat(parts[3]), Float.parseFloat(parts[4]), now);
             } else if ("K".equals(cmd) && parts.length >= 2) {
                 int keyCode = Integer.parseInt(parts[1]);
                 int flags = 8;
