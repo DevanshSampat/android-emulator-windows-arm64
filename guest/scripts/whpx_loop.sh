@@ -158,9 +158,9 @@ while true; do
   if [ ! -f /dev/whpx_scales_done ]; then
     LPID=$(pidof com.google.android.apps.nexuslauncher)
     if [ -n "$LPID" ]; then
-      settings put global window_animation_scale 0.5 2>/dev/null
-      settings put global transition_animation_scale 0.5 2>/dev/null
-      settings put global animator_duration_scale 0.5 2>/dev/null
+      settings put global window_animation_scale 1.0 2>/dev/null
+      settings put global transition_animation_scale 1.0 2>/dev/null
+      settings put global animator_duration_scale 1.0 2>/dev/null
       settings put global disable_hw_overlays 1 2>/dev/null
       settings put global disable_window_blurs 1 2>/dev/null
       touch /dev/whpx_scales_done 2>/dev/null

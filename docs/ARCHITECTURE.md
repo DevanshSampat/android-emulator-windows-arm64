@@ -54,6 +54,12 @@ The renderer watches compose and post operations for the current display buffer.
 
 Frames reach the bridge through a shared file: a 16-byte header, two frame slots, and an 8-byte tail holding the size the viewer wants.
 
+A capture starts when a compose is seen in the guest's stream, after a 5 ms settle, because the renderer may not have run the compose yet. Captures are not padded to a fixed interval: guest composes already pace them, and padding made a cycle longer than a 120 Hz frame. If a capture is identical to the frame already published, the compose was probably not finished, so the renderer reads again after 1 ms, up to three times, instead of publishing a repeat.
+
+Without native fence sync the guest ends every `eglSwapBuffers` with `glFinishRoundTrip`, which waits for the host GPU. Replying after only a flush was tried and rejected: under ANGLE another context could then read a buffer before the frame was in it, so every other frame showed older content. The renderer hides `ANDROID_EMU_sync_buffer_data`, which made every `glBufferData` wait for a host reply (about 3.7 ms per frame while scrolling).
+
+`WHPX_PERF=1` makes the renderer write per-connection timings to `%TEMP%\whpx_perf.log` once a second. While `%TEMP%\whpx_perf_bridge` exists, the bridge writes frames sent to Studio per second and their build and send times to `%TEMP%\whpx_stream_perf.log`.
+
 Guest vsync follows the host monitor's refresh rate. Phones and tablets also get `peak_refresh_rate` and `min_refresh_rate`, because Android otherwise caps app rendering at 60 fps.
 
 The renderer opts QEMU, itself and the bridge out of Windows power throttling. They have no window, so Windows treats them as background work.
@@ -61,7 +67,8 @@ The renderer opts QEMU, itself and the bridge out of Windows power throttling. T
 ## Networking, input and power
 
 - Networking uses QEMU user mode (slirp). `DefaultNetworkAgent` registers the connection with Android, and `whpx_init` keeps the routing rule alive.
-- Touch and keys reach Android through `WhpxInputDaemon`, which injects events through the input manager.
+- Touch and keys reach Android through `WhpxInputDaemon`, which injects events through the input manager. Mouse wheel and touchpad scrolling arrive as `ACTION_SCROLL` mouse events at the pointer position, scaled from Studio's 120 units per notch.
+- `whpx_loop.sh` sets the three animation scales to Android's default of 1.0 on each boot.
 - There is no battery device, so `whpx_init` provides one under `/sys/class/power_supply`, and `whpx_loop.sh` applies values set in Extended Controls.
 
 ## Device frames

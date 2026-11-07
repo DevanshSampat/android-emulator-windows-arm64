@@ -53,11 +53,14 @@ class ReplyPump : Stream {
         }
     }
 
+    public Perf.Ctx PerfCtx;  // measurement only, null unless WHPX_PERF=1
+
     void Drain() {
         if (len == 0) return;
         int n = len;
         len = 0;
         outp.Write(buf, 0, n);
+        if (PerfCtx != null) Perf.Drained(PerfCtx);
     }
 
     void Run() {
@@ -89,6 +92,157 @@ class ReplyPump : Stream {
     public override void SetLength(long v) { throw new NotSupportedException(); }
 }
 
+// Measurement only, enabled by WHPX_PERF=1: per-connection timing, one summary per
+// second in %TEMP%\whpx_perf.log. Off by default, and it changes no behaviour.
+static class Perf {
+    public static readonly bool On = Environment.GetEnvironmentVariable("WHPX_PERF") == "1";
+    static readonly double MsPerTick = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+    public static long Now() { return System.Diagnostics.Stopwatch.GetTimestamp(); }
+
+    public class Ctx {
+        public long writes, bytesIn, lockWait, inspect, writeCall;
+        public long sendStart;          // start of the most recent write to the renderer
+        public int awaiting;            // 1 while that write has had no reply byte yet
+        public long replyBytes, readTicks, emptyPolls, emptyWhileAwaiting;
+        public long frames, lastFrame;
+        public long lastDrain; public int drained;               // reply bytes handed to the socket
+        public int tailOp;                                       // rc op ending the latest write, 0 for GL or unknown
+        public readonly Dictionary<int, double[]> byOp = new Dictionary<int, double[]>(); // op -> {count, sumMs, over0.8ms}
+        public readonly List<double> back = new List<double>(); // reply sent -> next guest write, ms
+        public readonly List<double> rt = new List<double>();   // write start -> first reply byte, ms
+        public readonly List<double> gaps = new List<double>(); // between frame ops, ms
+    }
+
+    static readonly ConcurrentDictionary<uint, Ctx> ctxs = new ConcurrentDictionary<uint, Ctx>();
+    public static Ctx Get(uint id) { return ctxs.GetOrAdd(id, k => new Ctx()); }
+    public static void Forget(uint id) { Ctx c; ctxs.TryRemove(id, out c); }
+
+    public static void Wrote(Ctx c, int n, long t0, long t1, long t2, long t3) {
+        Interlocked.Increment(ref c.writes);
+        Interlocked.Add(ref c.bytesIn, n);
+        Interlocked.Add(ref c.lockWait, t1 - t0);
+        Interlocked.Add(ref c.inspect, t2 - t1);
+        Interlocked.Add(ref c.writeCall, t3 - t2);
+    }
+
+    public static void Drained(Ctx c) {
+        Interlocked.Exchange(ref c.lastDrain, Now());
+        Interlocked.Exchange(ref c.drained, 1);
+    }
+
+    // Called when guest bytes arrive. If a reply went out since the last write, the
+    // gap covers the trip back to the guest, the guest's own work, and the trip here.
+    public static void Arrived(Ctx c) {
+        if (Interlocked.Exchange(ref c.drained, 0) == 1) {
+            double ms = (Now() - Interlocked.Read(ref c.lastDrain)) * MsPerTick;
+            lock (c.back) c.back.Add(ms);
+        }
+    }
+
+    public static void BeforeSend(Ctx c, long t) {
+        Interlocked.Exchange(ref c.sendStart, t);
+        Interlocked.Exchange(ref c.awaiting, 1);
+    }
+
+    public static void Read(Ctx c, int rc, long a, long b) {
+        if (rc != 0) {
+            Interlocked.Increment(ref c.emptyPolls);
+            if (Volatile.Read(ref c.awaiting) == 1) Interlocked.Increment(ref c.emptyWhileAwaiting);
+            return;
+        }
+        Interlocked.Increment(ref c.replyBytes);
+        Interlocked.Add(ref c.readTicks, b - a);
+        if (Interlocked.Exchange(ref c.awaiting, 0) == 1) {
+            double ms = (b - Interlocked.Read(ref c.sendStart)) * MsPerTick;
+            int op = Volatile.Read(ref c.tailOp);
+            lock (c.rt) {
+                c.rt.Add(ms);
+                double[] s;
+                if (!c.byOp.TryGetValue(op, out s)) c.byOp[op] = s = new double[3];
+                s[0]++; s[1] += ms; if (ms > 0.8) s[2]++;
+            }
+        }
+    }
+
+    public static void Tail(uint id, int op) { Volatile.Write(ref Get(id).tailOp, op); }
+
+    static string Ops(Dictionary<int, double[]> d) {
+        StringBuilder sb = new StringBuilder();
+        foreach (KeyValuePair<int, double[]> kv in d.OrderByDescending(x => x.Value[1]).Take(6))
+            sb.Append(kv.Key == 0 ? "gl" : kv.Key.ToString()).Append(string.Format("=n{0}/avg{1:F2}/slow{2} ", kv.Value[0], kv.Value[1] / kv.Value[0], kv.Value[2]));
+        return sb.ToString().TrimEnd();
+    }
+
+    // Reply times in 0.1 ms buckets up to 6 ms, as "bucket:count" pairs.
+    static string Hist(List<double> v) {
+        int[] h = new int[61];
+        foreach (double x in v) h[Math.Min(60, (int)(x * 10))]++;
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < h.Length; i++) if (h[i] > 0) sb.Append(i / 10.0).Append(':').Append(h[i]).Append(' ');
+        return sb.ToString().TrimEnd();
+    }
+
+    public static void Frame(uint id) {
+        Ctx c = Get(id);
+        long t = Now();
+        long prev = Interlocked.Exchange(ref c.lastFrame, t);
+        Interlocked.Increment(ref c.frames);
+        if (prev != 0) {
+            double ms = (t - prev) * MsPerTick;
+            if (ms < 100) lock (c.gaps) c.gaps.Add(ms);
+        }
+    }
+
+    static string Pct(List<double> v) {
+        if (v.Count == 0) return "-";
+        v.Sort();
+        return string.Format("p50={0:F2} p90={1:F2} max={2:F2} sum={3:F0}",
+            v[v.Count / 2], v[(int)(v.Count * 0.9)], v[v.Count - 1], v.Sum());
+    }
+
+    public static void Start() {
+        Thread t = new Thread(() => {
+            string path = Path.Combine(Path.GetTempPath(), "whpx_perf.log");
+            using (StreamWriter w = new StreamWriter(path, true)) {
+                w.AutoFlush = true;
+                w.WriteLine("# start " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+                long t0 = Now();
+                while (true) {
+                    Thread.Sleep(1000);
+                    double sec = (Now() - t0) * MsPerTick / 1000;
+                    foreach (KeyValuePair<uint, Ctx> kv in ctxs) {
+                        Ctx c = kv.Value;
+                        long writes = Interlocked.Exchange(ref c.writes, 0);
+                        long bytes = Interlocked.Exchange(ref c.bytesIn, 0);
+                        long lw = Interlocked.Exchange(ref c.lockWait, 0);
+                        long ins = Interlocked.Exchange(ref c.inspect, 0);
+                        long wc = Interlocked.Exchange(ref c.writeCall, 0);
+                        long rb = Interlocked.Exchange(ref c.replyBytes, 0);
+                        long rt = Interlocked.Exchange(ref c.readTicks, 0);
+                        long ep = Interlocked.Exchange(ref c.emptyPolls, 0);
+                        long ewa = Interlocked.Exchange(ref c.emptyWhileAwaiting, 0);
+                        long fr = Interlocked.Exchange(ref c.frames, 0);
+                        List<double> rts, gaps, back;
+                        lock (c.back) { back = new List<double>(c.back); c.back.Clear(); }
+                        Dictionary<int, double[]> ops;
+                        lock (c.rt) { rts = new List<double>(c.rt); c.rt.Clear(); ops = new Dictionary<int, double[]>(c.byOp); c.byOp.Clear(); }
+                        lock (c.gaps) { gaps = new List<double>(c.gaps); c.gaps.Clear(); }
+                        if (writes == 0 && rb == 0 && fr == 0) continue;
+                        w.WriteLine(string.Format(
+                            "t={0:F1} ctx={1} frames={2} gap[{3}] | writes={4} in={5:F2}MB lockWait={6:F1}ms inspect={7:F1}ms nativeWrite={8:F1}ms | replies={9} rt[{10}] replyBytes={11} inRead={12:F1}ms empty={13} emptyAwaiting={14} | back={15} back[{16}]",
+                            sec, kv.Key, fr, Pct(gaps), writes, bytes / 1048576.0, lw * MsPerTick, ins * MsPerTick, wc * MsPerTick,
+                            rts.Count, Pct(rts), rb, rt * MsPerTick, ep, ewa, back.Count, Pct(back)));
+                        if (rts.Count >= 50) w.WriteLine("  hist ctx=" + kv.Key + " rt " + Hist(rts) + " | back " + Hist(back));
+                        if (rts.Count >= 50) w.WriteLine("  ops ctx=" + kv.Key + " " + Ops(ops));
+                    }
+                }
+            }
+        });
+        t.IsBackground = true;
+        t.Start();
+    }
+}
+
 // Streams renderer replies to the guest, replacing advertised capability tokens
 // the WHPX VM cannot honour with spaces of equal length. Bytes are held back
 // only while they form a prefix of a token; Flush() releases them whenever the
@@ -103,12 +257,15 @@ class ReplyFilter {
         Encoding.ASCII.GetBytes("ANDROID_EMU_dma_v1"),
         Encoding.ASCII.GetBytes("ANDROID_EMU_dma_v2"),
         Encoding.ASCII.GetBytes("ANDROID_EMU_has_shared_slots_host_memory_allocator"),
+        // Makes every glBufferData wait for a host reply. Each reply crosses slirp
+        // twice, which cost about 3.7 ms per frame while scrolling. Without it the
+        // guest streams glBufferData like any other call.
+        Encoding.ASCII.GetBytes("ANDROID_EMU_sync_buffer_data"),
     };
     static readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> Logged = new System.Collections.Concurrent.ConcurrentDictionary<string, bool>();
     readonly Stream outp;
     readonly byte[] pend = new byte[96];
     int n;
-
     public ReplyFilter(Stream s) { outp = s; }
 
     // All tokens share this prefix. It is passed through unbuffered, so only bytes
@@ -206,6 +363,9 @@ class GfxstreamPipeServer {
 
     [DllImport("kernel32.dll", EntryPoint = "RtlMoveMemory")]
     static extern void CopyMemory(IntPtr dest, IntPtr src, UIntPtr count);
+
+    [DllImport("msvcrt.dll", CallingConvention = CallingConvention.Cdecl)]
+    static extern int memcmp(IntPtr a, IntPtr b, UIntPtr count);
 
     [DllImport("winmm.dll")]
     static extern uint timeBeginPeriod(uint uPeriod);
@@ -595,6 +755,7 @@ class GfxstreamPipeServer {
             int currentSlot = 0;
             int scaleCb = 0, scaleW = 0, scaleH = 0;
             int lastReqW = -1, lastReqH = -1;
+            int lastPubW = 0, lastPubH = 0, sameRetries = 0;
             byte[] outBytes = new byte[8 + lcdWidth * lcdHeight * 4];
             byte[] rowTemp = new byte[lcdWidth * 4];
 
@@ -604,7 +765,7 @@ class GfxstreamPipeServer {
                 int reqW, reqH;
                 bool wantScaled = CaptureRequest(out reqW, out reqH);
                 if (targetCb <= 0 || (seq == lastCapturedSeq && reqW == lastReqW && reqH == lastReqH)) {
-                    Thread.Sleep(2);
+                    Thread.Sleep(1);
                     continue;
                 }
                 lastCapturedSeq = seq;
@@ -714,6 +875,34 @@ class GfxstreamPipeServer {
                 }
                 sw.Stop();
 
+                // The capture starts when a compose is seen in the guest's stream, which can be
+                // before the renderer has run it. Then the read returns the previous frame again
+                // (and the next capture skips one: "13 13 0 27" pixels of scroll per frame).
+                // A frame identical to the last published one needs no publishing anyway, so
+                // read again shortly, a few times, before deciding nothing changed.
+                if (ok) {
+                    bool same = false;
+                    unsafe {
+                        // The previous frame is in the other slot of the frame file.
+                        if (sFramePtr != null && w == lastPubW && h == lastPubH) {
+                            same = memcmp((IntPtr)(sFramePtr + slotOffset), (IntPtr)(sFramePtr + 16 + currentSlot * pixBytes), (UIntPtr)(uint)(w * h * 4)) == 0;
+                        }
+                    }
+                    if (same) {
+                        if (sameRetries < 3) {
+                            sameRetries++;
+                            lastCapturedSeq = -1; // capture again without waiting for a new compose
+                            Thread.Sleep(1);
+                        } else {
+                            sameRetries = 0;
+                        }
+                        continue;
+                    }
+                    sameRetries = 0;
+                    lastPubW = w;
+                    lastPubH = h;
+                }
+
                 if (ok) {
                     unsafe {
                         if (sFramePtr != null) {
@@ -730,8 +919,9 @@ class GfxstreamPipeServer {
                         }
                     }
                 }
-                int elapsedMs = (int)sw.ElapsedMilliseconds;
-                if (elapsedMs < 7) Thread.Sleep(7 - elapsedMs);
+                // No padding here: captures are already paced by guest composes (at most the
+                // display rate). Padding to 7 ms plus the settle wait and sleep overshoot made
+                // a cycle longer than a 120 Hz frame, so frames were skipped (about 103 of 120).
             }
         } catch (Exception ex) {
             Console.WriteLine("[Capture] Error: " + ex);
@@ -847,6 +1037,23 @@ class GfxstreamPipeServer {
     }
 
     static void InspectOpcodes(uint ctxId, byte[] buf, int len) {
+        if (Perf.On) {
+            // Which rc op, if any, ends this write: the one whose reply the guest now awaits.
+            int tail = 0;
+            for (int off = 0; off <= len - 8; off += 4) {
+                if (buf[off + 1] != 0x27 || buf[off + 2] != 0 || buf[off + 3] != 0) continue;
+                int op = BitConverter.ToInt32(buf, off);
+                int pl = BitConverter.ToInt32(buf, off + 4);
+                if (op >= 10000 && op <= 10080 && pl >= 8 && off + pl == len) tail = op;
+            }
+            // GLES packets need not be 4-byte aligned: look back from the end for a
+            // header whose length reaches exactly to the end of this write.
+            for (int off = len - 8; tail == 0 && off >= 0 && off >= len - 4096; off--) {
+                int op = BitConverter.ToInt32(buf, off);
+                if (op >= 1024 && op < 2600 && BitConverter.ToInt32(buf, off + 4) == len - off) tail = op;
+            }
+            Perf.Tail(ctxId, tail);
+        }
         for (int off = 0; off <= len - 8; off += 4) {
             if (buf[off + 1] != 0x27 || buf[off + 2] != 0 || buf[off + 3] != 0) continue;
             int op = BitConverter.ToInt32(buf, off);
@@ -855,6 +1062,7 @@ class GfxstreamPipeServer {
             int pktLen = BitConverter.ToInt32(buf, off + 4);
             if (pktLen < 8 || pktLen > 16 * 1024 * 1024 || off + pktLen > len) continue;
 
+            if (Perf.On && (op == 10018 || op == 10037 || op == 10038 || (op >= 10058 && op <= 10061))) Perf.Frame(ctxId);
             if (op == 10006) FixChooseConfig(buf, off, pktLen);
             if (op == 10023 && pktLen == 40) NoteColorBufferRead(ctxId, buf, off, len);
             if (op == RcReadColorBufferYuv && pktLen == 36) NoteYuvRead(ctxId, buf, off, len);
@@ -1100,6 +1308,8 @@ class GfxstreamPipeServer {
                 // extension strings flowing back to the guest.
                 ReplyPump pump = new ReplyPump(ns);
                 ReplyFilter filter = new ReplyFilter(pump);
+                Perf.Ctx pc = Perf.On ? Perf.Get(id) : null;
+                pump.PerfCtx = pc;
                 Thread reader = new Thread(() => {
                     const int BulkChunk = 1024 * 1024; // at most bufSize/4
                     IntPtr rbuf = Marshal.AllocHGlobal(4096);
@@ -1112,7 +1322,9 @@ class GfxstreamPipeServer {
                     try {
                         while (running) {
                             rbox.w = 1;
+                            long pa = pc != null ? Perf.Now() : 0;
                             int rc = stream_renderer_transfer_read_iov(id, id, 0, 0, 0, ref rbox, 0, riovPtr, 1);
+                            if (pc != null) Perf.Read(pc, rc, pa, Perf.Now());
                             if (!running) break;
                             if (rc != 0) {
                                 filter.Flush();  // never hold back the tail of a reply
@@ -1187,14 +1399,19 @@ class GfxstreamPipeServer {
                     byte[] wbytes = new byte[1024 * 1024]; // at most bufSize/4 (see above); larger writes just arrive in pieces
                     int n;
                     while ((n = ns.Read(wbytes, 0, wbytes.Length)) > 0) {
+                        if (pc != null) Perf.Arrived(pc);
+                        long t0 = pc != null ? Perf.Now() : 0, t1 = 0, t2 = 0;
                         lock (gpuLock) {
+                            if (pc != null) t1 = Perf.Now();
                             InspectOpcodes(id, wbytes, n);
                             NoteGlReadPixels(id, wbytes, n);
                             Marshal.Copy(wbytes, 0, buf, n);
                             stream_renderer_box wbox = new stream_renderer_box { x = 0, y = 0, z = 0, w = (uint)n, h = 1, d = 1 };
+                            if (pc != null) { t2 = Perf.Now(); Perf.BeforeSend(pc, t2); }
                             int wrc = stream_renderer_transfer_write_iov(id, id, 0, 0, 0, ref wbox, 0, IntPtr.Zero, 0);
                             if (wrc != 0) Console.WriteLine("[PIPE ctx=" + id + "] write failed rc=" + wrc + " n=" + n);
                         }
+                        if (pc != null) Perf.Wrote(pc, n, t0, t1, t2, Perf.Now());
                     }
                 } finally {
                     running = false;
@@ -1217,6 +1434,7 @@ class GfxstreamPipeServer {
                     int staleBulk;
                     ctxPendingBulk.TryRemove(id, out staleBulk);
                     Console.WriteLine("[PIPE] Disconnected opengles ctx=" + id);
+                    if (pc != null) Perf.Forget(id);
                     if (readerDone) {
                         lock (gpuLock) {
                             try {
@@ -1313,6 +1531,7 @@ class GfxstreamPipeServer {
 
     static int Main(string[] args) {
         timeBeginPeriod(1);
+        if (Perf.On) Perf.Start();
         if (args.Length >= 2) {
             int.TryParse(args[0], out lcdWidth);
             int.TryParse(args[1], out lcdHeight);
