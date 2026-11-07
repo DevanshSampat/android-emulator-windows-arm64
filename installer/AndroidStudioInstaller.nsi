@@ -1,5 +1,5 @@
 ; ============================================================================
-; Android Studio 2026.2.1 (Windows ARM64) NSIS Setup Script
+; Android Studio 2026.2.2 (Windows ARM64) NSIS Setup Script
 ; Built for Windows on ARM (Snapdragon X Elite / X Plus / ARM64 PCs)
 ; Includes Native ARM64 Layoutlib & Compose Previews Pre-Configured
 ; Unofficial, independent build. Not affiliated with Google.
@@ -12,8 +12,8 @@
 
 ; General Configuration
 Name "Android Studio"
-Caption "Android Studio 2026.2.1 for Windows ARM64 (Unofficial) Setup"
-OutFile "AndroidStudio-2026.2.1-Windows-ARM64-Setup.exe"
+Caption "Android Studio 2026.2.2 for Windows ARM64 (Unofficial) Setup"
+OutFile "AndroidStudio-2026.2.2-Windows-ARM64-Setup.exe"
 InstallDir "$PROGRAMFILES64\Android\Android Studio"
 InstallDirRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\App Paths\studio64.exe" "Path"
 !ifdef TESTBUILD
@@ -38,7 +38,7 @@ SetCompressor /SOLID zlib
 ; ============================================================================
 ; Welcome page
 !define MUI_WELCOMEPAGE_TITLE "Android Studio Setup for Windows ARM64 (Unofficial)"
-!define MUI_WELCOMEPAGE_TEXT "This wizard installs an unofficial, independent Windows ARM64 build of Android Studio 2026.2.1 and an Android Emulator.$\r$\n$\r$\nThis project is not made, endorsed or supported by Google."
+!define MUI_WELCOMEPAGE_TEXT "This wizard installs an unofficial, independent Windows ARM64 build of Android Studio 2026.2.2 and an Android Emulator.$\r$\n$\r$\nThis project is not made, endorsed or supported by Google."
 !insertmacro MUI_PAGE_WELCOME
 
 ; License page
@@ -113,6 +113,32 @@ Section "Android Studio Core" SecCore
     Delete "$INSTDIR\bin\product-info.json"
   ${EndIf}
 
+  ; Installing over another version: files that version had and this one lacks would stay
+  ; behind, and stale jars in lib or plugins break start-up. product-info.json shows the folder
+  ; is an Android Studio install; only its program folders are removed (settings live in AppData).
+  ${If} ${FileExists} "$INSTDIR\product-info.json"
+  ${AndIf} ${FileExists} "$INSTDIR\bin\studio64.exe"
+    studio_running_check:
+    ClearErrors
+    Rename "$INSTDIR\bin\studio64.exe" "$INSTDIR\bin\studio64.exe.setupcheck"
+    ${If} ${Errors}
+      MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "Android Studio is running from $INSTDIR. Close it, then choose Retry." IDRETRY studio_running_check
+      Abort
+    ${EndIf}
+    Rename "$INSTDIR\bin\studio64.exe.setupcheck" "$INSTDIR\bin\studio64.exe"
+    DetailPrint "Removing the previous Android Studio version..."
+    RMDir /r "$INSTDIR\bin"
+    RMDir /r "$INSTDIR\jbr"
+    RMDir /r "$INSTDIR\lib"
+    RMDir /r "$INSTDIR\license"
+    RMDir /r "$INSTDIR\modules"
+    RMDir /r "$INSTDIR\plugins"
+    Delete "$INSTDIR\product-info.json"
+    Delete "$INSTDIR\build.txt"
+    Delete "$INSTDIR\LICENSE.txt"
+    Delete "$INSTDIR\NOTICE.txt"
+  ${EndIf}
+
   ; Write uninstaller binary into target installation directory
   WriteUninstaller "$INSTDIR\uninstall.exe"
   
@@ -123,12 +149,11 @@ Section "Android Studio Core" SecCore
   File "arm64_7z/7z.exe"
   File "arm64_7z/7z.dll"
   File "studio.7z"
-  File "studio_overlay.7z"
   File "emulator.7z"
   File "skins.7z"
   SetCompress auto
   
-  DetailPrint "Extracting Android Studio 2026.2.1 ARM64 distribution..."
+  DetailPrint "Extracting Android Studio 2026.2.2 ARM64 distribution..."
   DetailPrint "Installation path: $INSTDIR"
   
   ; Execute multi-threaded native ARM64 7-zip decompression directly to $INSTDIR
@@ -154,23 +179,9 @@ Section "Android Studio Core" SecCore
   ${EndIf}
   SetShellVarContext all
 
-  ; Files changed since studio.7z was built: the About screen label.
-  nsExec::ExecToLog '"$PLUGINSDIR\7z.exe" x -y -o"$INSTDIR" "$PLUGINSDIR\studio_overlay.7z"'
-  Pop $0
-  ${If} $0 != 0
-    MessageBox MB_OK|MB_ICONSTOP "Android Studio update extraction failed with exit code $0."
-    Abort
-  ${EndIf}
-
-  ; Device frames. Studio's WebP decoder is x64 only and cannot load on ARM64, so the skins it
-  ; copies into the SDK are shipped as PNG data. Skins already in an SDK are repaired too.
-  DetailPrint "Installing device frames..."
-  nsExec::ExecToLog '"$PLUGINSDIR\7z.exe" x -y -o"$INSTDIR\plugins\android\resources\device-art-resources" "$PLUGINSDIR\skins.7z"'
-  Pop $0
-  ${If} $0 != 0
-    MessageBox MB_OK|MB_ICONSTOP "Device frame extraction failed with exit code $0."
-    Abort
-  ${EndIf}
+  ; Device frames. Studio's WebP decoder is x64 only and cannot load on ARM64, so studio.7z
+  ; carries them as PNG data under their .webp names. Skins Studio already copied into an SDK
+  ; are repaired from skins.7z.
   SetShellVarContext current
   ${If} ${FileExists} "${SDK_ROOT}\skins\*.*"
     nsExec::ExecToLog '"$PLUGINSDIR\7z.exe" x -y -o"${SDK_ROOT}\skins" "$PLUGINSDIR\skins.7z"'
@@ -262,7 +273,7 @@ Section "Android Studio Core" SecCore
   ; 5. Native 64-bit Windows Installed Apps (Control Panel / Settings)
   ; ==========================================================================
   WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\AndroidStudioARM64" "DisplayName" "Android Studio"
-  WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\AndroidStudioARM64" "DisplayVersion" "2026.2.1"
+  WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\AndroidStudioARM64" "DisplayVersion" "2026.2.2"
   WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\AndroidStudioARM64" "Publisher" "Devansh Sampat"
   WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\AndroidStudioARM64" "DisplayIcon" "$INSTDIR\bin\studio.ico,0"
   WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\AndroidStudioARM64" "UninstallString" '"$INSTDIR\uninstall.exe"'
