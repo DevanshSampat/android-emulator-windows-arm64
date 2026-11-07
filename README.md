@@ -77,6 +77,23 @@ wsl -d Ubuntu -- bash build_whpx_init.sh
 `whpx_bridge` lives in `<sdk>\emulator`, and `WhpxLauncher.exe` is copied to
 `<sdk>\emulator\emulator.exe`. Everything is resolved relative to that folder.
 
+### Android Studio
+
+The installer's Android Studio is Google's Windows release with every part that loads into the
+IDE process replaced by an ARM64 build: the JetBrains Runtime, the launcher and its helpers, and
+the JNA, Skiko, pty4j and SQLite libraries from IntelliJ IDEA for Windows ARM64 on the same
+platform build, plus ARM64 Layoutlib from
+[layoutlib-windows-arm64](https://github.com/DevanshSampat/layoutlib-windows-arm64). Google's Java
+code is used unchanged.
+
+```bat
+python installer\assemble_studio.py <google-studio> <idea-arm64> <layoutlib-dlls> <out>
+python installer\skinconv.py <out>\plugins\android\resources\device-art-resources
+```
+
+The script stops if Studio and IntelliJ are on different platform builds or Java runtimes, and if
+any x64 DLL that is not on its list of known-unavailable libraries would load into the IDE.
+
 These are **not in this repository** and ship in the installer: QEMU for Windows ARM64, gfxstream
 and its dependencies from the Android Emulator, prebuilt kernels and kernel modules, a Python
 runtime with `lz4` and `capstone`, and the patched guest libraries.
