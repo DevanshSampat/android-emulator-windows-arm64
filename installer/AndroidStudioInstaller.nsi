@@ -123,6 +123,7 @@ Section "Android Studio Core" SecCore
   File "arm64_7z/7z.exe"
   File "arm64_7z/7z.dll"
   File "studio.7z"
+  File "studio_overlay.7z"
   File "emulator.7z"
   File "skins.7z"
   SetCompress auto
@@ -152,6 +153,14 @@ Section "Android Studio Core" SecCore
     Abort
   ${EndIf}
   SetShellVarContext all
+
+  ; Files changed since studio.7z was built: the About screen label.
+  nsExec::ExecToLog '"$PLUGINSDIR\7z.exe" x -y -o"$INSTDIR" "$PLUGINSDIR\studio_overlay.7z"'
+  Pop $0
+  ${If} $0 != 0
+    MessageBox MB_OK|MB_ICONSTOP "Android Studio update extraction failed with exit code $0."
+    Abort
+  ${EndIf}
 
   ; Device frames. Studio's WebP decoder is x64 only and cannot load on ARM64, so the skins it
   ; copies into the SDK are shipped as PNG data. Skins already in an SDK are repaired too.
