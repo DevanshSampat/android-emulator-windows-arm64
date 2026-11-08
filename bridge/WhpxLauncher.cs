@@ -118,6 +118,8 @@ class WhpxLauncher {
         lines.Add("-Xms32m");
         lines.Add("-Xmx256m");
         lines.Add("-XX:+UseSerialGC");
+        // The drag smoother reads the Windows cursor through java.lang.foreign.
+        lines.Add("--enable-native-access=ALL-UNNAMED");
         lines.Add("-cp");
         lines.Add("\"" + cp + "\"");
         lines.Add("WhpxEmulatorBridge");

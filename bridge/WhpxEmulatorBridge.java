@@ -1058,6 +1058,15 @@ public class WhpxEmulatorBridge {
 
 
             }
+            // GfxstreamPipeServer.exe is the native ARM64 renderer (gfxstream and ANGLE built for
+            // ARM64, in lib64-arm64). WHPX_RENDERER=x64 runs the x64 one instead, under Windows'
+            // x64 emulation with the Android Emulator's own libraries, in case a GPU driver does
+            // not get on with the native build.
+            Path gfxX64Exe = Paths.get(bridgeDir, "GfxstreamPipeServer.x64.exe");
+            if ("x64".equalsIgnoreCase(System.getenv("WHPX_RENDERER")) && Files.exists(gfxX64Exe)) {
+                gfxExe = gfxX64Exe;
+                System.out.println("[WhpxEmulatorBridge] using the x64 renderer (WHPX_RENDERER=x64)");
+            }
 
 
 
@@ -7576,6 +7585,14 @@ public class WhpxEmulatorBridge {
 
 
 
+        static {
+            WhpxDragSmoother.sender = (x, y) -> {
+                mouseLastX = x;
+                mouseLastY = y;
+                sendDirectInput("T 2 " + x + " " + y);
+            };
+        }
+
         private static void handleMouseEvent(MouseEvent req) {
 
 
@@ -7651,345 +7668,26 @@ public class WhpxEmulatorBridge {
             pointerX = x;
             pointerY = y;
             boolean isDown = (req.getButtons() & 1) != 0;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-            if (isDown) {
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-                if (!mouseDown) {
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-                    mouseDown = true;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-                    mouseLastX = x;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-                    mouseLastY = y;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-                    sendDirectInput("T 0 " + x + " " + y);
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-                } else if (x != mouseLastX || y != mouseLastY) {
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-                    mouseLastX = x;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-                    mouseLastY = y;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-                    sendDirectInput("T 2 " + x + " " + y);
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-                }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-            } else {
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-                if (mouseDown) {
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+            // WhpxDragSmoother may send the moves of a drag itself (from the Windows cursor), so
+            // all of this runs under its lock, as its poller does.
+            synchronized (WhpxDragSmoother.LOCK) {
+                if (isDown) {
+                    if (!mouseDown) {
+                        mouseDown = true;
+                        mouseLastX = x;
+                        mouseLastY = y;
+                        sendDirectInput("T 0 " + x + " " + y);
+                        WhpxDragSmoother.onDown(x, y, maxW, maxH, curRot);
+                    } else if (!WhpxDragSmoother.onMove(x, y) && (x != mouseLastX || y != mouseLastY)) {
+                        mouseLastX = x;
+                        mouseLastY = y;
+                        sendDirectInput("T 2 " + x + " " + y);
+                    }
+                } else if (mouseDown) {
                     mouseDown = false;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+                    WhpxDragSmoother.onUp(x, y);
                     sendDirectInput("T 1 " + mouseLastX + " " + mouseLastY);
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
                 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
             }
 
 
