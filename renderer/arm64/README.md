@@ -17,7 +17,7 @@ The x64 renderer (`GfxstreamPipeServer.x64.exe`, the same source built for x64) 
 `gfxstream-windows-arm64.patch` adapts standalone gfxstream to how this emulator calls it:
 
 - **Locks the frontend's context and resource maps.** Standalone gfxstream expects one VMM thread to call it. The renderer calls it from every guest connection's threads, which corrupted its heap.
-- **Gives pipe reads their own buffer.** Reads and writes on one pipe shared a buffer, so concurrent use mixed up command streams.
+- **Gives pipe reads their own buffer.** Reads and writes on one pipe shared a buffer, so concurrent use mixed up command streams. The read buffer is sized for the reads that happen, so it doesn't add a zero-filled copy of the pipe's buffer to every guest connection.
 - **Makes the one-byte pipe poll non-blocking.** It waits up to 2 ms for data and then reports "no data", instead of blocking. The renderer flushes held reply bytes when a read is empty, so a blocking read could hang apps (Chrome did) with a reply stuck in the buffer.
 - **Builds with clang-cl for Windows ARM64** (`time.cpp` and `vk_common_operations.cpp`).
 
@@ -37,7 +37,9 @@ git apply ..\gfxstream-windows-arm64.patch
 cd .. && set LLVM=C:\path\to\llvm && build-gfxstream.cmd
 ```
 
-The DLL is `build-gfxstream\gfxstream_backend.dll`. Install it as `lib64-arm64\libgfxstream_backend.dll`.
+The DLL is `build-gfxstream\gfxstream_backend.dll`. Install it as `lib64-arm64\libgfxstream_backend.dll`. It links the C++ runtime statically, so it depends only on Windows system DLLs: a clean Windows install has no ARM64 Visual C++ runtime. ANGLE's build does the same by default.
+
+The renderer itself is an ARM64 .NET Framework program, so it needs Windows 11 22H2 or later, which includes .NET Framework 4.8.1 for ARM64.
 
 ### ANGLE
 
