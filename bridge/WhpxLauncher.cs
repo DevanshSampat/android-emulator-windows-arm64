@@ -105,7 +105,6 @@ class WhpxLauncher {
             Path.Combine(studio, "plugins", "android", "lib", "emulator_java_proto.jar"),
             Path.Combine(studio, "lib", "intellij.libraries.protobuf.jar"),
             Path.Combine(studio, "lib", "intellij.libraries.guava.jar"),
-            Path.Combine(studio, "lib", "app.jar"),
             Path.Combine(studio, "lib", "util-8.jar"),
             bridgeDir
         };
@@ -113,6 +112,12 @@ class WhpxLauncher {
         string runArgsFile = Path.Combine(Path.GetTempPath(), "java_run_args_" + myPid + ".txt");
 
         List<string> lines = new List<string>();
+        // Without limits the JVM may grow the heap to a quarter of host RAM, and each frame sent
+        // to Studio is a new array. Live data stays under about 100 MB; the serial collector
+        // suits a small heap with one busy thread and gives memory back when it shrinks.
+        lines.Add("-Xms32m");
+        lines.Add("-Xmx256m");
+        lines.Add("-XX:+UseSerialGC");
         lines.Add("-cp");
         lines.Add("\"" + cp + "\"");
         lines.Add("WhpxEmulatorBridge");

@@ -545,13 +545,45 @@ class GfxstreamPipeServer {
         cbHostRefs.AddOrUpdate(handle, count, (k, v) => v + count);
     }
 
-    static void NoteCbUse(int cb, int op) {
+    static void NoteCbUse(int cb, int op, uint ctx = 0) {
         if (cb <= 0 || cb >= 100000) return;
         cbLastUse[cb] = Environment.TickCount;
         if (cbReleased.ContainsKey(cb)) {
             int n = Interlocked.Increment(ref cbUseAfterRelease);
-            if (n <= 50) Console.WriteLine("[CB] USE AFTER RELEASE cb=" + cb + " op=" + op + " (#" + n + ")");
+            if (n <= 50) Console.WriteLine("[CB] USE AFTER RELEASE cb=" + cb + " op=" + op + " ctx=" + ctx + " (#" + n + ")");
         }
+    }
+
+    // Diagnostic only: while %TEMP%\whpx_cb_dump exists, CbReleaseLoop writes every tracked colour
+    // buffer to %TEMP%\whpx_cb_dump.txt once and deletes the flag. Nothing here changes behaviour.
+    static readonly string CbDumpFlag = Path.Combine(Path.GetTempPath(), "whpx_cb_dump");
+    static void DumpCbState() {
+        var sb = new StringBuilder();
+        int now = Environment.TickCount;
+        var queued = new HashSet<int>(cbReleaseQueue.ToArray().Select(q => q[0]));
+        var onWindow = new HashSet<int>(winPinnedCb.Values);
+        var handles = new SortedSet<int>(cbDims.Keys.Concat(cbHostRefs.Keys));
+        sb.AppendLine("time " + DateTime.Now.ToString("HH:mm:ss") + " tracked " + handles.Count + " hostRefs " + cbHostRefs.Count +
+            " queued " + queued.Count + " released " + cbReleasedTotal + " reported " + cbReportsTotal + " useAfterRelease " + cbUseAfterRelease +
+            " display " + activeDisplayCb + " compose " + masterComposeCb);
+        var groups = new Dictionary<string, int[]>(); // size -> count, refs, pinned, queued, onWindow, idle>60s
+        foreach (int h in handles) {
+            int[] d; int refs, used;
+            string size = cbDims.TryGetValue(h, out d) ? d[0] + "x" + d[1] : "?";
+            cbHostRefs.TryGetValue(h, out refs);
+            int idle = cbLastUse.TryGetValue(h, out used) ? unchecked(now - used) / 1000 : -1;
+            int[] g;
+            if (!groups.TryGetValue(size, out g)) groups[size] = g = new int[6];
+            g[0]++; g[1] += refs; if (cbPinned.ContainsKey(h)) g[2]++; if (queued.Contains(h)) g[3]++; if (onWindow.Contains(h)) g[4]++; if (idle < 0 || idle > 60) g[5]++;
+            if (d != null && d[0] * d[1] >= lcdWidth * lcdHeight / 2)
+                sb.AppendLine(string.Format("  cb {0,5} {1,-10} refs {2,2} pinned {3} queued {4} window {5} idle {6}s{7}", h, size, refs,
+                    cbPinned.ContainsKey(h) ? 1 : 0, queued.Contains(h) ? 1 : 0, onWindow.Contains(h) ? 1 : 0, idle,
+                    h == activeDisplayCb || h == masterComposeCb ? " DISPLAY" : ""));
+        }
+        sb.AppendLine("by size: count refs pinned queued window idle>60s");
+        foreach (var kv in groups.OrderByDescending(x => x.Value[0]))
+            sb.AppendLine(string.Format("  {0,-10} {1,5} {2,5} {3,5} {4,5} {5,5} {6,5}", kv.Key, kv.Value[0], kv.Value[1], kv.Value[2], kv.Value[3], kv.Value[4], kv.Value[5]));
+        File.WriteAllText(Path.Combine(Path.GetTempPath(), "whpx_cb_dump.txt"), sb.ToString());
     }
 
     static void NoteBufferGone(int handle) {
@@ -563,6 +595,10 @@ class GfxstreamPipeServer {
     static void CbReleaseLoop() {
         while (true) {
             Thread.Sleep(500);
+            if (File.Exists(CbDumpFlag)) {
+                try { File.Delete(CbDumpFlag); DumpCbState(); }
+                catch (Exception ex) { Console.WriteLine("[CB] dump failed: " + ex.Message); }
+            }
             int[] item;
             while (cbReleaseQueue.TryPeek(out item) && unchecked(Environment.TickCount - item[1]) >= CbReleaseGraceMs) {
                 if (!cbReleaseQueue.TryDequeue(out item)) break;
@@ -1070,15 +1106,15 @@ class GfxstreamPipeServer {
             // Every op naming a colour buffer, so that one still in use is never released.
             if (pktLen >= 12 && (op == 10013 || op == 10014 || op == 10018 || op == 10020 || op == 10021 ||
                                  op == 10023 || op == 10024 || op == 10025 || op == 10034 || op == 10064)) {
-                NoteCbUse(BitConverter.ToInt32(buf, off + 8), op);
+                NoteCbUse(BitConverter.ToInt32(buf, off + 8), op, ctxId);
             } else if (pktLen >= 16 && (op == 10015 || op == 10054 || op == 10040)) {
-                NoteCbUse(BitConverter.ToInt32(buf, off + 12), op);
+                NoteCbUse(BitConverter.ToInt32(buf, off + 12), op, ctxId);
             } else if (pktLen >= 32 && (op == 10037 || op == 10038) && BitConverter.ToInt32(buf, off + 16) == 2) {
                 // compose_device_v2 { version, displayId, targetHandle, numHwLayers, layers[] }
-                NoteCbUse(BitConverter.ToInt32(buf, off + 24), op);
+                NoteCbUse(BitConverter.ToInt32(buf, off + 24), op, ctxId);
                 int layers = BitConverter.ToInt32(buf, off + 28);
                 for (int l = 0; l < layers && l < 64 && 32 + (l + 1) * 56 <= pktLen; l++) {
-                    NoteCbUse(BitConverter.ToInt32(buf, off + 32 + l * 56), op);
+                    NoteCbUse(BitConverter.ToInt32(buf, off + 32 + l * 56), op, ctxId);
                 }
             }
             if (pktLen == 12 && (op == 10013 || op == 10025)) CountHostRefs(BitConverter.ToInt32(buf, off + 8), 1);
