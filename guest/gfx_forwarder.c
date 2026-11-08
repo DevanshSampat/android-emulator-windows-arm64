@@ -14,6 +14,7 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <signal.h>
+#include <time.h>
 
 #define MAX_EVENTS 64
 #define BUF_SIZE 65536
@@ -45,33 +46,82 @@ static struct Connection conns[1024];
 struct RefPipe {
     char data[32];  /* "pipe:refcount\0" + uint32 handle */
     int len;
+    uint32_t gen;   /* renderer instance the buffer was created on */
 };
 
+/* Handles are numbered per renderer instance, and the bridge restarts a renderer that
+ * dies. A pipe from the previous instance would then report an old handle number that
+ * the new renderer has reused for a live buffer, which it would free while on screen.
+ * The control connection stays open so a renderer's death is seen at once (EOF); each
+ * death starts a new generation, and only pipes of the current one are reported. */
+#define CTRL_CID 1020
 static struct RefPipe ref_pipes[MAX_REF_FDS];
 static int ctrl_fd = -1;
 static struct sockaddr_in* ctrl_addr;
+static int g_epoll_fd = -1;
+static uint32_t ref_gen = 1;
+static unsigned long stale_reports = 0;
 
-static void report_buffer_gone(uint32_t handle) {
-    for (int attempt = 0; attempt < 2; attempt++) {
-        if (ctrl_fd < 0) {
-            int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-            if (fd < 0) return;
-            struct timeval tv = { 1, 0 };
-            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-            int one = 1;
-            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-            static const char hello[] = "whpx:refs";
-            if (connect(fd, (struct sockaddr*)ctrl_addr, sizeof(*ctrl_addr)) != 0 ||
-                write(fd, hello, sizeof(hello)) != (ssize_t)sizeof(hello)) {
-                close(fd);
-                return;  /* the host keeps the buffer: a leak, never a wrong free */
-            }
-            ctrl_fd = fd;
-        }
-        if (write(ctrl_fd, &handle, 4) == 4) return;
+static void ctrl_lost(void) {
+    if (ctrl_fd >= 0) {
+        if (g_epoll_fd >= 0) epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, ctrl_fd, NULL);
         close(ctrl_fd);
         ctrl_fd = -1;
     }
+    ref_gen++;
+    printf("[gfx_forwarder] renderer connection lost: buffer generation %u\n", ref_gen);
+    fflush(stdout);
+}
+
+static void ctrl_connect(void) {
+    if (ctrl_fd >= 0) return;
+    /* connect() can block for up to a second while the renderer is away, and this one
+     * thread carries every guest graphics connection: try at most once a second. */
+    static struct timespec last;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (last.tv_sec && now.tv_sec - last.tv_sec < 1) return;
+    last = now;
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return;
+    struct timeval tv = { 1, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    static const char hello[] = "whpx:refs";
+    if (connect(fd, (struct sockaddr*)ctrl_addr, sizeof(*ctrl_addr)) != 0 ||
+        write(fd, hello, sizeof(hello)) != (ssize_t)sizeof(hello)) {
+        close(fd);
+        return;
+    }
+    ctrl_fd = fd;
+    if (g_epoll_fd >= 0) {
+        struct epoll_event ev;
+        ev.events = EPOLLIN | EPOLLRDHUP;
+        ev.data.u64 = ((uint64_t)CTRL_CID << 32) | (uint32_t)fd;
+        epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, fd, &ev);
+    }
+}
+
+/* The renderer never writes on the control connection: readable means closed. */
+static void service_ctrl(void) {
+    char b[16];
+    ssize_t n = read(ctrl_fd, b, sizeof(b));
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return;
+    ctrl_lost();
+}
+
+static void report_buffer_gone(uint32_t handle, uint32_t gen) {
+    if (gen != ref_gen) {
+        if (++stale_reports <= 20) {
+            printf("[gfx_forwarder] not reporting handle %u from buffer generation %u (now %u)\n", handle, gen, ref_gen);
+            fflush(stdout);
+        }
+        return;
+    }
+    ctrl_connect();
+    if (ctrl_fd < 0) return;  /* the host keeps the buffer: a leak, never a wrong free */
+    if (write(ctrl_fd, &handle, 4) != 4) ctrl_lost();
 }
 
 static void accept_ref_pipes(int epoll_fd, int listen_fd) {
@@ -83,6 +133,8 @@ static void accept_ref_pipes(int epoll_fd, int listen_fd) {
             continue;
         }
         ref_pipes[fd].len = 0;
+        ctrl_connect();  /* so a renderer death is noticed before its buffers die */
+        ref_pipes[fd].gen = ref_gen;
         struct epoll_event ev;
         ev.events = EPOLLIN;
         ev.data.u64 = ((uint64_t)REFS_CID << 32) | (uint32_t)fd;
@@ -110,7 +162,7 @@ static void service_ref_pipe(int epoll_fd, int fd) {
     if (nul && p->len - (nul + 1 - p->data) >= 4) {
         uint32_t handle;
         memcpy(&handle, nul + 1, 4);
-        if (handle) report_buffer_gone(handle);
+        if (handle) report_buffer_gone(handle, p->gen);
     }
 }
 
@@ -288,6 +340,7 @@ int main(int argc, char** argv) {
         perror("epoll_create1");
         return 1;
     }
+    g_epoll_fd = epoll_fd;
 
     struct epoll_event ev;
     ev.events = EPOLLIN;
@@ -342,6 +395,10 @@ int main(int argc, char** argv) {
             uint32_t cid = (uint32_t)(events[i].data.u64 >> 32);
             int fd = (int)(events[i].data.u64 & 0xFFFFFFFF);
 
+            if (cid == CTRL_CID) {
+                if (fd == ctrl_fd) service_ctrl();
+                continue;
+            }
             if (cid == REFS_CID) {
                 if (fd == refs_fd) accept_ref_pipes(epoll_fd, refs_fd);
                 else service_ref_pipe(epoll_fd, fd);

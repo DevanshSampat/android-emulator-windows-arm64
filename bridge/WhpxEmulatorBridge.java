@@ -2919,7 +2919,9 @@ public class WhpxEmulatorBridge {
 
 
 
-            ramMb = Math.max(3072, Math.min(6144, rawRam));
+            // The RAM set in Device Manager. Guests now have zram (compressed swap), so the
+            // 3 GB floor that once covered for its absence would cost the host 1 GB for nothing.
+            ramMb = Math.max(2048, Math.min(8192, rawRam));
 
 
 
@@ -5058,7 +5060,7 @@ public class WhpxEmulatorBridge {
 
                     }
 
-                    bs = ByteString.copyFrom(rgba);
+                    bs = com.android.tools.idea.protobuf.UnsafeByteOperations.unsafeWrap(rgba); // fresh array, not reused
 
                 } else if (curRot == 0 && w == fw && h == fh && fw == lcdWidth && fmt == ImageFormat.ImgFormat.RGB888) {
 
@@ -5084,7 +5086,7 @@ public class WhpxEmulatorBridge {
 
                     }
 
-                    bs = ByteString.copyFrom(rgb);
+                    bs = com.android.tools.idea.protobuf.UnsafeByteOperations.unsafeWrap(rgb); // fresh array, not reused
 
                 } else {
 
@@ -5196,7 +5198,7 @@ public class WhpxEmulatorBridge {
 
                     }
 
-                    bs = ByteString.copyFrom(raw);
+                    bs = com.android.tools.idea.protobuf.UnsafeByteOperations.unsafeWrap(raw); // fresh array, not reused
 
                 }
 
@@ -5464,7 +5466,7 @@ public class WhpxEmulatorBridge {
 
 
 
-            bs = ByteString.copyFrom(rawBytes);
+            bs = com.android.tools.idea.protobuf.UnsafeByteOperations.unsafeWrap(rawBytes); // fresh array, not reused
 
 
 
