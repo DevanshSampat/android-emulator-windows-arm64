@@ -48,7 +48,7 @@ Renderer (GfxstreamPipeServer + gfxstream) <---- TCP through slirp --- gfx_forwa
 | Folder | Contents |
 |---|---|
 | `bridge/` | `emulator.exe` launcher, gRPC emulator service, QEMU launch, Extended Controls |
-| `renderer/` | Hosts gfxstream, relays guest GL traffic, captures frames |
+| `renderer/` | Hosts gfxstream, relays guest GL traffic, captures frames. `renderer/arm64/` builds the native ARM64 gfxstream and ANGLE it runs on |
 | `guest/` | `whpx_init` (first-stage init), GL forwarder, address-space stubs, agents, boot scripts |
 | `image-tools/` | Builds the per-image ramdisk and patches stock vendor binaries at first boot |
 | `installer/` | Assembles the distributable emulator and the NSIS installer |
@@ -63,10 +63,13 @@ Requires Windows 11 ARM64, Android Studio, the .NET Framework 4 compiler, and WS
 `gcc-aarch64-linux-gnu` and `nsis`.
 
 ```bat
-:: bridge\ and renderer\ (javac from Android Studio's JBR; classpath is Studio's gRPC and proto jars)
-csc -platform:x64 -optimize+ -unsafe -out:GfxstreamPipeServer.exe GfxstreamPipeServer.cs
+:: bridge\ and renderer\ (javac from Android Studio's JBR; classpath is Studio's gRPC and proto jars).
+:: lib64-arm64 (gfxstream and ANGLE for ARM64): see renderer\arm64\README.md.
+:: The native renderer needs Roslyn (Visual Studio's csc) for ARM64; the x64 fallback builds with either.
+csc -platform:arm64 -optimize+ -unsafe -noconfig -nostdlib -r:mscorlib.dll -r:System.dll -r:System.Core.dll -out:GfxstreamPipeServer.exe GfxstreamPipeServer.cs
+csc -platform:x64 -optimize+ -unsafe -out:GfxstreamPipeServer.x64.exe GfxstreamPipeServer.cs
 csc -optimize+ -out:WhpxLauncher.exe WhpxLauncher.cs
-javac -nowarn -cp <studio jars> WhpxExtendedControls.java WhpxEmulatorBridge.java
+javac -nowarn -cp <studio jars> WhpxExtendedControls.java WhpxEmulatorBridge.java WhpxDragSmoother.java
 ```
 
 ```sh
@@ -94,14 +97,18 @@ python installer\skinconv.py <out>\plugins\android\resources\device-art-resource
 The script stops if Studio and IntelliJ are on different platform builds or Java runtimes, and if
 any x64 DLL that is not on its list of known-unavailable libraries would load into the IDE.
 
-These are **not in this repository** and ship in the installer: QEMU for Windows ARM64, gfxstream
-and its dependencies from the Android Emulator, prebuilt kernels and kernel modules, a Python
-runtime with `lz4` and `capstone`, and the patched guest libraries.
+These are **not in this repository** and ship in the installer: QEMU for Windows ARM64, the native
+gfxstream and ANGLE libraries (built from source as in `renderer/arm64`), the Android Emulator's
+x64 gfxstream for the fallback renderer, prebuilt kernels and kernel modules, a Python runtime with
+`lz4` and `capstone`, and the patched guest libraries.
 
 ## Licences
 
 The code here is under the Apache License 2.0. The installer also carries third-party software
 under its own terms, including QEMU (GPL v2, licence files alongside the binaries, source at
-[qemu.org](https://www.qemu.org/download/)) and Android components (Apache 2.0).
+[qemu.org](https://www.qemu.org/download/)), Android components (Apache 2.0), and the native
+graphics libraries: gfxstream (Apache 2.0), ANGLE (BSD 3-Clause) and the Vulkan loader
+(Apache 2.0), with the components built into them listed in `renderer/arm64/NOTICE.txt`, which
+also ships in `emulator\lib64-arm64`.
 
 This project is not affiliated with or endorsed by Google.

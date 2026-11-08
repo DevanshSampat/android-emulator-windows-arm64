@@ -358,6 +358,104 @@ class GfxstreamPipeServer {
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     public delegate void FenceCallback(IntPtr userData, ref ulong fenceData);
 
+    // gfxstream's log messages (STREAM_RENDERER_PARAM_DEBUG_CALLBACK_EX). Its own output goes
+    // through the C runtime's buffered stdio and is lost when it aborts, so the native build
+    // routes messages here, written and flushed one by one. Not used with the Android
+    // Emulator's x64 build (the fallback renderer), which crashes on this parameter.
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate void DebugCallbackEx(IntPtr userData, IntPtr debug);
+    static DebugCallbackEx sDebugCallback;
+    static readonly object sDebugLock = new object();
+    static StreamWriter sDebugLog;
+
+    // Native build only: on an access violation inside a non-.NET module, log where (module +
+    // offset) and the frame-pointer chain, so the crash can be symbolised. Reads go through
+    // ReadProcessMemory: a bad pointer must not fault again inside the handler.
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    delegate int VectoredHandler(IntPtr exceptionPointers);
+    static VectoredHandler sVeh;
+    [DllImport("kernel32.dll")] static extern IntPtr AddVectoredExceptionHandler(uint first, VectoredHandler handler);
+    [DllImport("kernel32.dll")] static extern bool GetModuleHandleExW(uint flags, IntPtr address, out IntPtr module);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern uint GetModuleFileNameW(IntPtr module, StringBuilder name, uint size);
+    [DllImport("kernel32.dll")] static extern bool ReadProcessMemory(IntPtr process, IntPtr address, byte[] buffer, IntPtr size, out IntPtr read);
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+    static int sVehReports;
+
+    static string Where(long addr) {
+        addr &= 0x0000FFFFFFFFFFFFL; // drop ARM64 pointer-authentication bits from return addresses
+        IntPtr mod;
+        if (addr == 0 || !GetModuleHandleExW(0x4 | 0x2, (IntPtr)addr, out mod)) return "0x" + addr.ToString("x");
+        var sb = new StringBuilder(260);
+        GetModuleFileNameW(mod, sb, 260);
+        return Path.GetFileName(sb.ToString()) + "+0x" + (addr - mod.ToInt64()).ToString("x");
+    }
+
+    static long ReadI64(long addr) {
+        byte[] b = new byte[8]; IntPtr n;
+        return ReadProcessMemory(GetCurrentProcess(), (IntPtr)addr, b, (IntPtr)8, out n) && n.ToInt64() == 8 ? BitConverter.ToInt64(b, 0) : 0;
+    }
+
+    static int OnVectoredException(IntPtr ep) {
+        try {
+            IntPtr rec = Marshal.ReadIntPtr(ep, 0), ctx = Marshal.ReadIntPtr(ep, 8);
+            uint code = (uint)Marshal.ReadInt32(rec, 0);
+            long pc = Marshal.ReadInt64(rec, 16);
+            string at = Where(pc);
+            if (code != 0xC0000005 || at.StartsWith("0x") || at.StartsWith("clr.dll") || at.StartsWith("mscor") ||
+                Interlocked.Increment(ref sVehReports) > 5) return 0;
+            // ARM64 CONTEXT: X0..X28 from offset 8, Fp (X29) at 0xF0, Lr at 0xF8, Sp 0x100, Pc 0x108.
+            long fp = Marshal.ReadInt64(ctx, 0xF0), lr = Marshal.ReadInt64(ctx, 0xF8);
+            long fault = Marshal.ReadInt32(rec, 24) >= 2 ? Marshal.ReadInt64(rec, 40) : 0; // ExceptionInformation[1]
+            var sb = new StringBuilder("ACCESS VIOLATION at " + at + " (address 0x" + fault.ToString("x") + ") thread " +
+                                       Thread.CurrentThread.ManagedThreadId + "\n    lr " + Where(lr));
+            for (int i = 0; i < 24 && fp != 0; i++) {
+                long ret = ReadI64(fp + 8) & 0x0000FFFFFFFFFFFFL, next = ReadI64(fp);
+                if (ret == 0) break;
+                sb.Append("\n    #" + i + " " + Where(ret));
+                if (next <= fp) break;
+                fp = next;
+            }
+            OnDebugText("E", sb.ToString());
+        } catch {}
+        return 0; // EXCEPTION_CONTINUE_SEARCH
+    }
+
+    static void OnDebugText(string level, string text) {
+        lock (sDebugLock) {
+            Console.WriteLine("[gfx " + level + "] " + text);
+            Console.Out.Flush();
+            WriteDebugLog("[gfx " + level + "] " + text);
+        }
+    }
+
+    // %TEMP%\whpx_gfx_native.log: warnings, errors and crash reports of this run (started afresh
+    // each time). Called holding sDebugLock.
+    static void WriteDebugLog(string text) {
+        try {
+            if (sDebugLog == null) sDebugLog = new StreamWriter(Path.Combine(Path.GetTempPath(), "whpx_gfx_native.log"), false);
+            sDebugLog.WriteLine(DateTime.Now.ToString("HH:mm:ss.fff") + " " + text);
+            sDebugLog.Flush();
+        } catch {}
+    }
+
+    static void OnDebug(IntPtr userData, IntPtr d) {
+        try {
+            // struct stream_renderer_debug_ex { uint32 type; char* file; int line; char* function; char* message; }
+            int type = Marshal.ReadInt32(d, 0);
+            string file = Marshal.PtrToStringAnsi(Marshal.ReadIntPtr(d, 8)) ?? "";
+            int line = Marshal.ReadInt32(d, 16);
+            string msg = Marshal.PtrToStringAnsi(Marshal.ReadIntPtr(d, 32)) ?? "";
+            string level = type == 1 ? "E" : type == 2 ? "W" : type == 3 ? "I" : "D";
+            if (level == "D") return;
+            string text = "[gfx " + level + "] " + Path.GetFileName(file) + ":" + line + " " + msg;
+            lock (sDebugLock) {
+                Console.WriteLine(text);
+                Console.Out.Flush();
+                if (level == "E" || level == "W") WriteDebugLog(text);
+            }
+        } catch {}
+    }
+
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool SetDllDirectory(string lpPathName);
 
@@ -405,6 +503,8 @@ class GfxstreamPipeServer {
 
     [DllImport("libgfxstream_backend.dll", CallingConvention = CallingConvention.Cdecl)]
     static extern void stream_renderer_teardown();
+
+    static bool sStandaloneGfx; // gfxstream built from source (the native ARM64 renderer)
 
     static ConcurrentQueue<uint> idPool = new ConcurrentQueue<uint>(Enumerable.Range(10, 50).Select(x => (uint)x));
     static int nextId = 70;
@@ -1364,7 +1464,9 @@ class GfxstreamPipeServer {
                             if (!running) break;
                             if (rc != 0) {
                                 filter.Flush();  // never hold back the tail of a reply
-                                Thread.Sleep(2);
+                                // Standalone gfxstream already waited (up to 2 ms, waking on data)
+                                // before reporting "no data"; sleeping again would delay replies.
+                                if (!sStandaloneGfx) Thread.Sleep(2);
                                 continue;
                             }
                             byte rb = Marshal.ReadByte(rbuf, 0);
@@ -1595,12 +1697,30 @@ class GfxstreamPipeServer {
 
         // This exe lives in <sdk>\emulator\whpx_bridge.
         string emuDir = Path.GetDirectoryName(AppDomain.CurrentDomain.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar));
-        string lib64 = Path.Combine(emuDir, "lib64");
+        // The ARM64 build of this program loads ARM64 graphics libraries: gfxstream built from
+        // source and ANGLE, in lib64-arm64. The x64 build (the fallback, run under x64 emulation)
+        // uses the Android Emulator's own x64 libraries in lib64.
+        bool nativeArm64 = IntPtr.Size == 8 && Environment.GetEnvironmentVariable("PROCESSOR_ARCHITECTURE") == "ARM64" &&
+                           Directory.Exists(Path.Combine(emuDir, "lib64-arm64"));
+        bool standaloneGfx = nativeArm64;
+        sStandaloneGfx = standaloneGfx;
+        string lib64 = Path.Combine(emuDir, nativeArm64 ? "lib64-arm64" : "lib64");
+        string gfxDir = lib64;
+        Console.WriteLine("[GfxstreamPipeServer] graphics libraries: " + gfxDir);
         Environment.SetEnvironmentVariable("PATH", lib64 + ";" + Path.Combine(lib64, "gles_angle") + ";" + Path.Combine(lib64, "vulkan") + ";" + Environment.GetEnvironmentVariable("PATH"));
         // ANGLE's D3D11 and D3D9 backends crash on gfxstream's render threads here.
-        Environment.SetEnvironmentVariable("ANGLE_DEFAULT_PLATFORM", "vulkan");
+        // ANGLE loads vulkan-1.dll from its own folder, so lib64-arm64 carries the loader too.
+        // ANGLE_DEFAULT_PLATFORM set by the caller still wins.
+        if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ANGLE_DEFAULT_PLATFORM")))
+            Environment.SetEnvironmentVariable("ANGLE_DEFAULT_PLATFORM", "vulkan");
+        // Current ANGLE submits Vulkan work and frees garbage on its own threads. With gfxstream's
+        // many contexts on many threads that crashed in context flush (null pointers in
+        // libGLESv2 and ntdll); with these off, Android boots. The x64 ANGLE predates them.
+        if (nativeArm64 && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ANGLE_FEATURE_OVERRIDES_DISABLED")))
+            Environment.SetEnvironmentVariable("ANGLE_FEATURE_OVERRIDES_DISABLED",
+                "asyncCommandQueue:asyncCommandBufferResetAndGarbageCleanup:asyncGarbageCleanup");
         Environment.SetEnvironmentVariable("ANDROID_EMULATOR_FEATURES", "VirtioGpuNativeSync:disabled,VirtioGpuNext:disabled,RefCountPipe:enabled,NoDelayCloseColorBuffer:disabled,GlDirectMem:disabled,GlDma:disabled,GlDma2:disabled,ReadColorBufferDma:disabled,HasSharedSlotsHostMemoryAllocator:disabled");
-        SetDllDirectory(lib64);
+        SetDllDirectory(gfxDir);
 
         sFenceCallback = new FenceCallback(OnFence);
         IntPtr fcPtr = Marshal.GetFunctionPointerForDelegate(sFenceCallback);
@@ -1618,9 +1738,26 @@ class GfxstreamPipeServer {
             // YuvCache: without it the guest mapper reads YUV buffers (every decoded video
             // frame) into a width*height*3 heap buffer with a 4 byte per pixel read and
             // overruns it, crashing media.swcodec on the first frame.
-            new stream_renderer_param { key = 11, value = (ulong)Marshal.StringToHGlobalAnsi("NoDelayCloseColorBuffer:disabled,YuvCache:enabled").ToInt64() }
+            // The ARM64 build is standalone gfxstream, which does not read ANDROID_EMULATOR_FEATURES,
+            // so the overrides go here. RefCountPipe stays off on the host there: with it on,
+            // standalone gfxstream ignores rcCloseColorBuffer and frees buffers only through its
+            // own refcount pipe service, which gfx_forwarder replaces, so ReleaseColorBuffer's
+            // closes did nothing and every buffer stayed allocated (1.3 GB more after ten apps).
+            new stream_renderer_param { key = 11, value = (ulong)Marshal.StringToHGlobalAnsi(standaloneGfx
+                ?"NoDelayCloseColorBuffer:disabled,YuvCache:enabled,VirtioGpuNativeSync:disabled,VirtioGpuNext:disabled,RefCountPipe:disabled,GlDirectMem:disabled,GlDma:disabled,GlDma2:disabled,HasSharedSlotsHostMemoryAllocator:disabled"
+                : "NoDelayCloseColorBuffer:disabled,YuvCache:enabled").ToInt64() }
         };
 
+        if (standaloneGfx) {
+            if (nativeArm64) { // the handler reads the ARM64 CONTEXT layout
+                sVeh = new VectoredHandler(OnVectoredException);
+                AddVectoredExceptionHandler(1, sVeh);
+            }
+            sDebugCallback = new DebugCallbackEx(OnDebug);
+            var withLog = new List<stream_renderer_param>(p);
+            withLog.Add(new stream_renderer_param { key = 7, value = (ulong)Marshal.GetFunctionPointerForDelegate(sDebugCallback).ToInt64() });
+            p = withLog.ToArray();
+        }
         int rc = stream_renderer_init(p, (ulong)p.Length);
         Console.WriteLine("[GfxstreamPipeServer] stream_renderer_init(" + lcdWidth + "x" + lcdHeight + ") rc = " + rc);
         if (rc != 0) return 1;

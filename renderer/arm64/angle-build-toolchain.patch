@@ -1,0 +1,44 @@
+diff --git a/toolchain/win/setup_toolchain.py b/toolchain/win/setup_toolchain.py
+index 521c243..e2a174c 100644
+--- a/toolchain/win/setup_toolchain.py
++++ b/toolchain/win/setup_toolchain.py
+@@ -22,7 +22,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
+ import gn_helpers
+ 
+ SCRIPT_DIR = os.path.dirname(__file__)
+-SDK_VERSION = '10.0.22621.0'
++SDK_VERSION = '10.0.26100.0'
+ 
+ 
+ def _ExtractImportantEnvironment(output_of_set):
+diff --git a/vs_toolchain.py b/vs_toolchain.py
+index a9cd6f0..76d55d3 100755
+--- a/vs_toolchain.py
++++ b/vs_toolchain.py
+@@ -40,7 +40,7 @@ from gn_helpers import ToGNString
+ # * MSVS_VERSIONS in this file
+ #   Records the packaged and default version of Visual Studio
+ TOOLCHAIN_HASH = '27370823e7'
+-SDK_VERSION = '10.0.22621.0'
++SDK_VERSION = '10.0.26100.0'
+ 
+ script_dir = os.path.dirname(os.path.realpath(__file__))
+ json_data_file = os.path.join(script_dir, 'win_toolchain.json')
+@@ -57,7 +57,7 @@ MSVS_VERSIONS = collections.OrderedDict([
+ # List of preferred VC toolset version based on MSVS
+ # Order is not relevant for this dictionary.
+ MSVC_TOOLSET_VERSION = {
+-    '2022': 'VC143',
++    '2022': 'VC145',  # local: Visual Studio 2026 (18) installed as the 2022 slot
+     '2019': 'VC142',
+     '2017': 'VC141',
+ }
+@@ -432,7 +432,7 @@ def _CopyDebugger(target_dir, target_cpu):
+ 
+   # List of debug files that should be copied, the first element of the tuple is
+   # the name of the file and the second indicates if it's optional.
+-  debug_files = [('dbghelp.dll', False), ('dbgcore.dll', True)]
++  debug_files = [('dbghelp.dll', True), ('dbgcore.dll', True)]  # local: Debugging Tools not installed
+   for debug_file, is_optional in debug_files:
+     full_path = os.path.join(win_sdk_dir, 'Debuggers', target_cpu, debug_file)
+     if not os.path.exists(full_path):
