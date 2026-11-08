@@ -20,7 +20,7 @@ Run stock Android system images on Windows 11 ARM64 from Android Studio. System 
 ## Boot
 
 1. The bridge reads the AVD's `config.ini` and the image's metadata.
-2. API 34 and above boot `kernel_whpx_universal` (6.1.23). Older images boot `kernel_p7_permissive` (5.15.119). `prepare_whpx_initrd.py` adds the matching modules from `modules_whpx_6_1` or `modules_whpx_5_15`.
+2. API 34 and above boot `kernel_whpx_universal` (6.1.23). Older images boot `kernel_p7_permissive` (5.15.119). `prepare_whpx_initrd.py` adds the matching modules from `modules_whpx_6_1` or `modules_whpx_5_15`. These include `zram.ko` and `zsmalloc.ko`, taken from the stock image with the same kernel build (API 33 `vendor.img`; API 34 `system_dlkm` inside `system.img`), so the zram swap that every image's fstab asks for is set up. The guest gets the RAM set in Device Manager (`hw.ramSize`), with a floor of 2 GB.
 3. On the first boot of an image, `vendor_extract.py` reads `vendor.img` (GPT, then ext4 or erofs) and `gfx_autopatch.py` patches its binaries by signature. Results are cached per image hash and shipped as an extra ramdisk segment.
 4. `whpx_init` bind-mounts the patched files over `/vendor` when the property service appears, and starts `gfx_forwarder`.
 5. After boot, the bridge pushes the input daemon, network agent and guest scripts through adb.
@@ -45,7 +45,7 @@ Guest GL client -> @whpx_pipe -> gfx_forwarder -> TCP via slirp -> GfxstreamPipe
 Each GL connection gets its own pipe resource and render thread. Details that matter:
 
 - `ReplyFilter` hides capabilities the guest cannot use, such as native sync and DMA.
-- Colour buffers live until the guest closes their refcount pipe. `gfx_forwarder` reports that to the host, and the host releases the buffer after a grace period.
+- Colour buffers live until the guest closes their refcount pipe. `gfx_forwarder` reports that to the host, and the host releases the buffer after a grace period. Handles are numbered per renderer instance, so the forwarder keeps its control connection open, starts a new generation when the renderer goes away, and only reports pipes of the current generation. Otherwise, after a renderer restart, buffers from the old instance would free unrelated live buffers that reuse their numbers.
 - `FixChooseConfig` rewrites `EGL_DONT_CARE` for bitmask attributes, which the host would otherwise match as a mask.
 
 ## Display
@@ -58,7 +58,7 @@ A capture starts when a compose is seen in the guest's stream, after a 5 ms sett
 
 Without native fence sync the guest ends every `eglSwapBuffers` with `glFinishRoundTrip`, which waits for the host GPU. Replying after only a flush was tried and rejected: under ANGLE another context could then read a buffer before the frame was in it, so every other frame showed older content. The renderer hides `ANDROID_EMU_sync_buffer_data`, which made every `glBufferData` wait for a host reply (about 3.7 ms per frame while scrolling).
 
-`WHPX_PERF=1` makes the renderer write per-connection timings to `%TEMP%\whpx_perf.log` once a second. While `%TEMP%\whpx_perf_bridge` exists, the bridge writes frames sent to Studio per second and their build and send times to `%TEMP%\whpx_stream_perf.log`.
+`WHPX_PERF=1` makes the renderer write per-connection timings to `%TEMP%\whpx_perf.log` once a second. While `%TEMP%\whpx_perf_bridge` exists, the bridge writes frames sent to Studio per second and their build and send times to `%TEMP%\whpx_stream_perf.log`. Creating `%TEMP%\whpx_cb_dump` makes the renderer write every tracked colour buffer (size, host references, pinned, queued, idle time) to `%TEMP%\whpx_cb_dump.txt` once.
 
 Guest vsync follows the host monitor's refresh rate. Phones and tablets also get `peak_refresh_rate` and `min_refresh_rate`, because Android otherwise caps app rendering at 60 fps.
 

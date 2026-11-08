@@ -226,6 +226,15 @@ def prepare_ramdisk_base(sys_dir, avd_dir):
             modules_dep_data = b"/lib/modules/system_heap.ko:\n/lib/modules/virtio_mmio.ko:\n/lib/modules/virtio-rng.ko:\n/lib/modules/virtio_blk.ko:\n/lib/modules/virtio_dma_buf.ko:\n/lib/modules/virtio_console.ko:\n/lib/modules/vmw_vsock_virtio_transport.ko:\n/lib/modules/virtio_pci.ko: /lib/modules/virtio_pci_modern_dev.ko\n/lib/modules/virtio_pci_modern_dev.ko:\n/lib/modules/failover.ko:\n/lib/modules/net_failover.ko: /lib/modules/failover.ko\n/lib/modules/virtio_net.ko: /lib/modules/net_failover.ko /lib/modules/failover.ko\n"
             modules_alias_data = b"# Aliases extracted from modules themselves.\nalias of:N*T*Cvirtio,mmio virtio_mmio\nalias of:N*T*Cvirtio,mmioC* virtio_mmio\nalias virtio:d00000004v* virtio_rng\nalias virtio:d00000002v* virtio_blk\nalias virtio:d00000003v* virtio_console\nalias virtio:d0000000Bv* virtio_console\nalias virtio:d00000013v* vmw_vsock_virtio_transport\nalias pci:v00001AF4d*sv*sd*bc*sc*i* virtio_pci\nalias virtio:d00000001v* virtio_net\n"
 
+        # zram: compressed swap in RAM. Every image's fstab asks for it (zram0, 75% of RAM) and
+        # Android sizes its memory management around it, but these kernels build it as a module
+        # that only the image's own (mismatched) vendor modules provide. The copies here come from
+        # the stock image with the same kernel build. Listed only when present: first-stage init
+        # stops the boot if a listed module is missing.
+        if all(os.path.isfile(os.path.join(modules_dir, m)) for m in ('zsmalloc.ko', 'zram.ko')):
+            modules_load_data += b"zsmalloc.ko\nzram.ko\n"
+            modules_dep_data += b"/lib/modules/zsmalloc.ko:\n/lib/modules/zram.ko: /lib/modules/zsmalloc.ko\n"
+
         if os.path.isdir(modules_dir):
             for m in os.listdir(modules_dir):
                 if m.endswith('.ko'):
