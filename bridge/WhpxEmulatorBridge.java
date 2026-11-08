@@ -320,8 +320,26 @@ public class WhpxEmulatorBridge {
             w = ((int) Math.ceil(lcdWidth * scale) + 1) & ~1;
             h = ((int) Math.ceil(lcdHeight * scale) + 1) & ~1;
         }
-        writeCaptureSize(w, h);
+        // Studio can have several screenshot streams open at once (two views of the device at
+        // slightly different sizes). Each used to write its own size every frame, so the
+        // request flipped between them and the renderer rebuilt its scaled buffer every frame,
+        // which ran it up to gigabytes. Ask for one size that suits every stream: full size if
+        // any stream needs it, else the largest, and write it only when it changes.
+        captureRequests.put(Thread.currentThread(), new int[] { w, h });
+        int cw = -1, ch = -1;
+        for (int[] r : captureRequests.values()) {
+            if (r[0] == 0) { cw = 0; ch = 0; break; }
+            cw = Math.max(cw, r[0]);
+            ch = Math.max(ch, r[1]);
+        }
+        if (cw < 0) return;
+        synchronized (captureRequests) {
+            int tail = 16 + lcdWidth * lcdHeight * 4 * 2;
+            if (frameMbb.getInt(tail) == cw && frameMbb.getInt(tail + 4) == ch) return;
+            writeCaptureSize(cw, ch);
+        }
     }
+    private static final java.util.concurrent.ConcurrentHashMap<Thread, int[]> captureRequests = new java.util.concurrent.ConcurrentHashMap<>();
 
     private static void writeCaptureSize(int w, int h) {
         int tail = 16 + lcdWidth * lcdHeight * 4 * 2;
@@ -5984,6 +6002,7 @@ public class WhpxEmulatorBridge {
 
 
                 }
+                captureRequests.remove(Thread.currentThread());
 
 
 

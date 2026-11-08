@@ -499,14 +499,27 @@ index 896a9d6..13c142c 100644
          // Try to get some data from the RenderThread.
          if (mReadBuffer.empty()) {
 diff --git a/host/virtio_gpu_resource.cpp b/host/virtio_gpu_resource.cpp
-index 4531a51..91e8b79 100644
+index 4531a51..0b10df6 100644
 --- a/host/virtio_gpu_resource.cpp
 +++ b/host/virtio_gpu_resource.cpp
-@@ -513,7 +513,21 @@ int VirtioGpuResource::TransferRead(uint64_t offset, stream_renderer_box* box,
+@@ -513,7 +513,34 @@ int VirtioGpuResource::TransferRead(uint64_t offset, stream_renderer_box* box,
          GFXSTREAM_ERROR("Failed to transfer: unexpected blob.");
          return -EINVAL;
      } else if (mResourceType == VirtioGpuResourceType::PIPE) {
-+        if (mPipeReadLinear.size() != mLinear.size()) mPipeReadLinear.resize(mLinear.size(), 0);
++        // Sized for the reads that happen (a poll reads one byte, a capture chunk at most a
++        // quarter of the buffer), not a second zero-filled copy of mLinear per connection: that
++        // added 16 MB to every guest connection, gigabytes while apps start.
++        if (box && mCreateArgs) {
++            const size_t needed = std::max<size_t>(
++                static_cast<size_t>(box->x) + box->w,
++                GetTransferOffset(mCreateArgs->format, mCreateArgs->width, mCreateArgs->height,
++                                  box->x, box->y, box->w, box->h) +
++                    GetTransferSize(mCreateArgs->format, mCreateArgs->width, mCreateArgs->height,
++                                    box->x, box->y, box->w, box->h));
++            if (mPipeReadLinear.size() < needed) {
++                mPipeReadLinear.resize(std::min(needed, mLinear.size()), 0);
++            }
++        }
          ret = ReadFromPipeToLinear(offset, box);
 +        if (ret == EAGAIN) {
 +            return ret;  // nothing to read yet: normal for a polling caller
@@ -524,7 +537,7 @@ index 4531a51..91e8b79 100644
      } else if (mResourceType == VirtioGpuResourceType::BUFFER) {
          ret = ReadFromBufferToLinear(offset, box);
      } else if (mResourceType == VirtioGpuResourceType::COLOR_BUFFER) {
-@@ -591,14 +605,14 @@ int VirtioGpuResource::ReadFromPipeToLinear(uint64_t offset, stream_renderer_box
+@@ -591,14 +618,14 @@ int VirtioGpuResource::ReadFromPipeToLinear(uint64_t offset, stream_renderer_box
          return -EINVAL;
      }
  
@@ -544,7 +557,7 @@ index 4531a51..91e8b79 100644
  }
  
  int VirtioGpuResource::WriteToPipeFromLinear(uint64_t offset, stream_renderer_box* box) {
-@@ -775,7 +789,9 @@ int VirtioGpuResource::TransferFromIov(uint64_t offset, const stream_renderer_bo
+@@ -775,7 +802,9 @@ int VirtioGpuResource::TransferFromIov(uint64_t offset, const stream_renderer_bo
  
  int VirtioGpuResource::TransferWithIov(uint64_t offset, const stream_renderer_box* box,
                                         const std::vector<struct iovec>& iovs,
@@ -555,7 +568,7 @@ index 4531a51..91e8b79 100644
      if (!mCreateArgs || !box) {
          GFXSTREAM_ERROR("failed to transfer: missing resource args.");
          return -EINVAL;
-@@ -805,7 +821,7 @@ int VirtioGpuResource::TransferWithIov(uint64_t offset, const stream_renderer_bo
+@@ -805,7 +834,7 @@ int VirtioGpuResource::TransferWithIov(uint64_t offset, const stream_renderer_bo
          return -EINVAL;
      }
  
@@ -564,7 +577,7 @@ index 4531a51..91e8b79 100644
          GFXSTREAM_ERROR("failed to transfer: start + length overflows!");
          return -EINVAL;
      }
-@@ -814,7 +830,7 @@ int VirtioGpuResource::TransferWithIov(uint64_t offset, const stream_renderer_bo
+@@ -814,7 +843,7 @@ int VirtioGpuResource::TransferWithIov(uint64_t offset, const stream_renderer_bo
      uint32_t iovIndex = 0;
      size_t iovOffset = 0;
      size_t written = 0;

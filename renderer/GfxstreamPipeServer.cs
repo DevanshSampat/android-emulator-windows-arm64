@@ -565,13 +565,27 @@ class GfxstreamPipeServer {
     // A full-size read is the slowest step of the display path (25 ms for 1280x2856), and the
     // viewer usually shows far fewer pixels. The bridge writes the size it wants after the frame
     // slots; the GPU then scales into a buffer of that size and only that is read back.
+    // The size the viewer asked for, as accepted: a full-size request (a screenshot) takes effect
+    // at once, but a new scaled size only after it has been asked for steadily for 250 ms. Each
+    // change of scaled size rebuilds a colour buffer, so a request flipping between two sizes
+    // every frame (two views of the device) must not reach the capture loop.
+    static int sAcceptedW = -1, sAcceptedH = -1, sPendingW = -1, sPendingH = -1, sPendingSince;
     static unsafe bool CaptureRequest(out int reqW, out int reqH) {
         reqW = reqH = 0;
         if (sFramePtr == null) return false;
         long tail = 16L + lcdWidth * lcdHeight * 4L * 2;
-        reqW = *(int*)(sFramePtr + tail);
-        reqH = *(int*)(sFramePtr + tail + 4);
-        return reqW >= 16 && reqH >= 16 && reqW < lcdWidth && reqH < lcdHeight;
+        int w = *(int*)(sFramePtr + tail);
+        int h = *(int*)(sFramePtr + tail + 4);
+        bool scaled = w >= 16 && h >= 16 && w < lcdWidth && h < lcdHeight;
+        if (!scaled) { w = 0; h = 0; }
+        if (w != sAcceptedW || h != sAcceptedH) {
+            int now = Environment.TickCount;
+            if (w != sPendingW || h != sPendingH) { sPendingW = w; sPendingH = h; sPendingSince = now; }
+            if (!scaled || sAcceptedW < 0 || now - sPendingSince >= 250) { sAcceptedW = w; sAcceptedH = h; }
+        }
+        reqW = sAcceptedW;
+        reqH = sAcceptedH;
+        return reqW > 0;
     }
 
     // rcCreateColorBuffer on the capture connection, closing the buffer of the old size.
