@@ -247,7 +247,7 @@ public class WhpxEmulatorBridge {
 
 
 
-    private static int cpuCores = 6;
+    private static int cpuCores = 4;
 
 
 
@@ -361,6 +361,20 @@ public class WhpxEmulatorBridge {
     }
 
     // The ramdisk tools run on Python with lz4; users are not expected to have either.
+    /*
+     * API 34+ guests tick from Hyper-V's synthetic timer instead of the architected timer.
+     * On some Snapdragon X hosts (X1-26-100) Hyper-V's arch-timer emulation stalls the vCPU
+     * between ticks and the guest runs about 100x slower; the WSL2 kernel avoids this the same
+     * way. Needs kernel_whpx_stimer (stock android14-6.1 plus the whpx_stimer driver), its
+     * modules, QEMU's Hyper-V enlightenments and "whpx_stimer" on the command line.
+     * WHPX_TIMER=arch goes back to the stock kernel and the architected timer.
+     */
+    private static boolean useStimerKernel(int apiNum) {
+        if (apiNum < 34 || "arch".equalsIgnoreCase(System.getenv("WHPX_TIMER"))) return false;
+        return Files.exists(Paths.get(bridgeDir, "kernel_whpx_stimer"))
+            && Files.isDirectory(Paths.get(bridgeDir, "modules_whpx_6_1_stimer"));
+    }
+
     private static String pythonExe() {
         Path bundled = Paths.get(bridgeDir, "python", "python.exe");
         return Files.isRegularFile(bundled) ? bundled.toString() : "python";
@@ -1195,7 +1209,8 @@ public class WhpxEmulatorBridge {
 
 
         int apiNum = parseIntOrDefault(apiLevel, 34);
-        Path universalKernel = Paths.get(bridgeDir, "kernel_whpx_universal");
+        boolean stimer = useStimerKernel(apiNum);
+        Path universalKernel = Paths.get(bridgeDir, stimer ? "kernel_whpx_stimer" : "kernel_whpx_universal");
         Path p7Kernel = Paths.get(bridgeDir, "kernel_p7_permissive");
         String kernelPath;
         if (apiNum >= 34 && Files.exists(universalKernel)) {
@@ -1234,9 +1249,10 @@ public class WhpxEmulatorBridge {
 
             qemuExe,
 
+            // ROMs and keymaps live in share\ next to the exe; MSYS2 builds look in ..\share\qemu.
+            "-L", Paths.get(qemuExe).getParent().resolve("share").toString(),
 
-
-            "-accel", "whpx",
+            "-accel", stimer ? "whpx,hyperv=on" : "whpx",
 
 
 
@@ -1342,7 +1358,7 @@ public class WhpxEmulatorBridge {
 
 
 
-            "-append", "console=ttyAMA0,38400 earlyprintk=ttyAMA0 audit=0 loglevel=7 androidboot.hardware=ranchu " + "androidboot.serialno=" + getSerialPrefix(sysDir) + " androidboot.boot_devices=3f000000.pcie androidboot.selinux=permissive androidboot.console=ttyAMA0 androidboot.verifiedbootstate=orange androidboot.flash.locked=0 androidboot.service.adb.tcp.port=5555 androidboot.radio.noril=yes androidboot.vendor.radio.noril=1 qemu=1 no_timer_check rcupdate.rcu_cpu_stall_timeout=60 bootconfig"
+            "-append", "console=ttyAMA0,38400 earlyprintk=ttyAMA0 audit=0 loglevel=7 androidboot.hardware=ranchu " + "androidboot.serialno=" + getSerialPrefix(sysDir) + " androidboot.boot_devices=3f000000.pcie androidboot.selinux=permissive androidboot.console=ttyAMA0 androidboot.verifiedbootstate=orange androidboot.flash.locked=0 androidboot.service.adb.tcp.port=5555 androidboot.radio.noril=yes androidboot.vendor.radio.noril=1 qemu=1 no_timer_check rcupdate.rcu_cpu_stall_timeout=60 bootconfig" + (stimer ? " whpx_stimer" : "")
 
 
 
@@ -2952,7 +2968,10 @@ public class WhpxEmulatorBridge {
 
 
 
-            cpuCores = Math.max(6, Math.min(8, parseIntOrDefault(cfg.get("hw.cpu.ncore"), 8)));
+            // The CPU cores set in Device Manager (4 if unset), never more than the host has
+            // and at most 8. There used to be a floor of 6, which ignored smaller settings.
+            int hostCores = Runtime.getRuntime().availableProcessors();
+            cpuCores = Math.max(1, Math.min(Math.min(8, hostCores), parseIntOrDefault(cfg.get("hw.cpu.ncore"), 4)));
 
 
 
@@ -3642,9 +3661,13 @@ public class WhpxEmulatorBridge {
         if (Files.exists(pyScript)) {
             try {
                 System.out.println("[WhpxEmulatorBridge] Preparing dynamic ramdisk base for " + sysDir);
-                Process pyProc = new ProcessBuilder(pythonExe(), pyScript.toString(), sysDir, avdDir)
-                    .inheritIO()
-                    .start();
+                ProcessBuilder pyPbInitrd = new ProcessBuilder(pythonExe(), pyScript.toString(), sysDir, avdDir)
+                    .inheritIO();
+                if (useStimerKernel(parseIntOrDefault(apiLevel, 34))) {
+                    // Modules built with kernel_whpx_stimer (same tree, compiler and signing key).
+                    pyPbInitrd.environment().put("WHPX_MODULES_6_1", "modules_whpx_6_1_stimer");
+                }
+                Process pyProc = pyPbInitrd.start();
                 pyProc.waitFor(30, TimeUnit.SECONDS);
             } catch (Exception e) {
                 System.err.println("[WhpxEmulatorBridge] Error running prepare_whpx_initrd.py: " + e);
