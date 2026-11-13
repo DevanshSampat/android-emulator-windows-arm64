@@ -75,6 +75,11 @@ javac -nowarn -cp <studio jars> WhpxExtendedControls.java WhpxEmulatorBridge.jav
 ```sh
 # guest/
 wsl -d Ubuntu -- bash build_whpx_init.sh
+# guest/kernel/: kernel_whpx_stimer and modules_whpx_6_1_stimer (Google's android14-6.1 plus
+# whpx_stimer.c; fetches the kernel source on first run, about 5 minutes on 12 cores)
+wsl -d Ubuntu -- bash build_kernel.sh /mnt/c/Users/<you>/AppData/Local/Android/Sdk/emulator/whpx_bridge
+# installer/: QEMU (MSYS2 clangarm64 build, currently 11.1.3) with exactly the DLLs it loads
+wsl -d Ubuntu -- python3 fetch_qemu.py ~/qemu-work <output dir>
 ```
 
 `whpx_bridge` lives in `<sdk>\emulator`, and `WhpxLauncher.exe` is copied to

@@ -210,8 +210,10 @@ def prepare_ramdisk_base(sys_dir, avd_dir):
         # Select matching WHPX kernel modules
         whpx_modules = {}
         bridge_dir = os.path.dirname(os.path.abspath(__file__))
-        if api_level >= 34 and os.path.isdir(os.path.join(bridge_dir, 'modules_whpx_6_1')):
-            modules_dir = os.path.join(bridge_dir, 'modules_whpx_6_1')
+        # The bridge sets WHPX_MODULES_6_1 when it boots kernel_whpx_stimer instead of the stock kernel.
+        modules_6_1 = os.environ.get('WHPX_MODULES_6_1') or 'modules_whpx_6_1'
+        if api_level >= 34 and os.path.isdir(os.path.join(bridge_dir, modules_6_1)):
+            modules_dir = os.path.join(bridge_dir, modules_6_1)
             # system_heap: as on 5.15 below. The image's own copy is built for a newer kernel and
             # is rejected, so without this one every Codec2 component fails with NO_MEMORY.
             # From the stock API 34 vendor.img, same build as this kernel.
