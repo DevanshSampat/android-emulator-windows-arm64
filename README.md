@@ -32,7 +32,7 @@ Controls, and guest vsync that follows the host monitor's refresh rate.
   has no native fence sync.
 - An intermittent freeze was seen on Android 13 and could not be reproduced on demand: a reply to
   the graphics allocator goes missing and the display stops. See `docs/ARCHITECTURE.md`.
-- Tested on one Snapdragon X machine so far.
+- Tested across Snapdragon X, X Plus and X Elite PCs.
 
 ## How it works
 
