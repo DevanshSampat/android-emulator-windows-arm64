@@ -59,7 +59,7 @@ for f in files:
     else:
         print('MISSING', f)
 for n in os.listdir(b):
-    if re.fullmatch(r'Whpx(EmulatorBridge|ExtendedControls|DragSmoother)(\$.*)?\.class', n):
+    if re.fullmatch(r'Whpx(EmulatorBridge|ExtendedControls|DragSmoother|HostTuning)(\$.*)?\.class', n):
         shutil.copy2(os.path.join(b, n), bd)
 for d in ('com', 'patched', 'patched_p33', 'python', 'modules_whpx_5_15', 'modules_whpx_6_1', 'modules_whpx_6_1_stimer'):
     if os.path.isdir(os.path.join(b, d)):
