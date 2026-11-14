@@ -1933,7 +1933,9 @@ public class WhpxEmulatorBridge {
 
 
 
-                    Process p = new ProcessBuilder(adbExe, "-s", emulatorSerial, "shell", "pidof com.google.android.apps.nexuslauncher || pidof com.android.launcher3 || [ \"$(getprop sys.boot_completed)\" = \"1\" ]").start();
+                    // Every branch must print something: Wear and TV have neither launcher, and a
+                    // silent boot_completed test left them without post-boot settings (screen timeout).
+                    Process p = new ProcessBuilder(adbExe, "-s", emulatorSerial, "shell", "pidof com.google.android.apps.nexuslauncher || pidof com.android.launcher3 || { [ \"$(getprop sys.boot_completed)\" = \"1\" ] && echo booted; }").start();
 
 
 
@@ -6807,7 +6809,8 @@ public class WhpxEmulatorBridge {
 
 
 
-            String key = req.getKey() != null ? req.getKey().trim() : "";
+            String rawKey = req.getKey() != null ? req.getKey() : "";
+            String key = rawKey.trim();
 
 
 
@@ -6816,6 +6819,9 @@ public class WhpxEmulatorBridge {
 
 
             int keyCode = req.getKeyCode();
+            // Studio sends the space bar as key " " or text " ". Trimming made the key empty, and
+            // the guest daemon trims each line, so "TEXT  " lost its space too: send KEYCODE_SPACE.
+            if (key.isEmpty() && (!rawKey.isEmpty() || " ".equals(text))) key = " ";
 
 
 
