@@ -520,6 +520,7 @@ public class WhpxEmulatorBridge {
                     Thread.sleep(300);
                     Process next = gpb.start();
                     gfxServerProc = next;
+                    WhpxHostTuning.boost(next, "renderer");
                     Thread log = new Thread(() -> {
                         try (BufferedReader r = new BufferedReader(new InputStreamReader(next.getInputStream(), StandardCharsets.UTF_8))) {
                             String line;
@@ -1143,6 +1144,7 @@ public class WhpxEmulatorBridge {
                 gpb.redirectErrorStream(true);
 
                 gfxServerProc = gpb.start();
+                WhpxHostTuning.boost(gfxServerProc, "renderer");
                 superviseGfxServer(gpb);
                 startBootPayloadServer();
 
@@ -1371,6 +1373,7 @@ public class WhpxEmulatorBridge {
 
 
         whpxProc = pb.start();
+        WhpxHostTuning.boostAndPin(whpxProc, "qemu", WhpxHostTuning.residentMbFor(ramMb));
 
 
 
@@ -2968,10 +2971,13 @@ public class WhpxEmulatorBridge {
 
 
 
-            // The CPU cores set in Device Manager (4 if unset), never more than the host has
-            // and at most 8. There used to be a floor of 6, which ignored smaller settings.
+            // Half the host's cores, or the CPU cores set in Device Manager if that is more; at most 8
+            // and never more than the host has. Studio creates devices with 4, and on a 12-core host
+            // 4 vCPUs made Android's UI threads compete: twice as many 120 Hz wake-ups ran more than
+            // 4 ms late as with 6.
             int hostCores = Runtime.getRuntime().availableProcessors();
-            cpuCores = Math.max(1, Math.min(Math.min(8, hostCores), parseIntOrDefault(cfg.get("hw.cpu.ncore"), 4)));
+            int wanted = Math.max(parseIntOrDefault(cfg.get("hw.cpu.ncore"), 4), hostCores / 2);
+            cpuCores = Math.max(1, Math.min(Math.min(8, hostCores), wanted));
 
 
 
