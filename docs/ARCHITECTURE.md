@@ -10,6 +10,8 @@ Run stock Android system images on Windows 11 ARM64 from Android Studio. System 
 |---|---|---|
 | `WhpxLauncher` | Host | Installed as `emulator.exe`. Finds Android Studio and starts the bridge in a kill-on-close job. |
 | `WhpxEmulatorBridge` | Host | gRPC emulator service for Studio, QEMU launch, AVD setup, Extended Controls. |
+| `WhpxStandaloneWindow`, `WhpxSkin` | Host | The emulator's own window with the device frame, when started outside Studio (Flutter, the command line). |
+| `WhpxHostTuning` | Host | Turns off Windows power throttling for QEMU and the renderer, raises their priority, keeps guest RAM resident. |
 | `GfxstreamPipeServer` | Host | Hosts `libgfxstream_backend.dll`, relays guest GL streams, captures frames. |
 | `prepare_whpx_initrd.py` | Host | Builds the per-image ramdisk. |
 | `vendor_extract.py`, `gfx_autopatch.py` | Host | Read the image's vendor partition and patch its binaries. |

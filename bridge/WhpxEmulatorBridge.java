@@ -124,6 +124,9 @@ public class WhpxEmulatorBridge {
 
 
 
+    // Set when the guest kernel logs a restart; QEMU runs with -no-reboot, so it exits and the bridge starts it again.
+    private static volatile boolean guestRebooting = false;
+    private static volatile int bootCount = 0;
     private static volatile boolean adbOnline = false;
 
 
@@ -228,6 +231,9 @@ public class WhpxEmulatorBridge {
 
     private static boolean is16kPages = false;
     private static boolean isPixel7 = false;
+    private static boolean isWear = false;
+    private static boolean windowHidden = false;
+    private static String skinPath = null;
 
 
 
@@ -653,6 +659,9 @@ public class WhpxEmulatorBridge {
 
 
                 try { requestedConsolePort = Integer.parseInt(args[++i]); } catch (Exception ignored) {}
+            } else if ("-qt-hide-window".equals(a) || "-no-window".equals(a)) {
+                // Studio passes -qt-hide-window and shows the device in its Running Devices panel.
+                windowHidden = true;
 
 
 
@@ -930,7 +939,7 @@ public class WhpxEmulatorBridge {
 
 
 
-            .addService(new EmulatorControllerServiceImpl())
+            .addService(controllerService)
 
 
 
@@ -951,6 +960,11 @@ public class WhpxEmulatorBridge {
 
 
         System.out.println("Started gRPC server on port " + grpcPort);
+        String windowEnv = System.getenv("WHPX_WINDOW");
+        if ("1".equals(windowEnv) || (!windowHidden && !"0".equals(windowEnv))) {
+            System.out.println("[WhpxEmulatorBridge] Started outside Android Studio: opening the emulator window");
+            WhpxStandaloneWindow.open(standaloneHost);
+        }
 
 
 
@@ -1356,6 +1370,7 @@ public class WhpxEmulatorBridge {
 
 
 
+            "-no-reboot",
             "-display", "none",
 
 
@@ -1435,6 +1450,10 @@ public class WhpxEmulatorBridge {
 
 
 
+        // Threads that follow one QEMU run: serial console, adb, guest bring-up, post-boot settings.
+        // They run again for the fresh QEMU after Android restarts itself.
+        Runnable bootThreads = () -> {
+        final Process proc = whpxProc;
         final AtomicBoolean bootCmdTriggered = new AtomicBoolean(false);
 
 
@@ -1451,7 +1470,7 @@ public class WhpxEmulatorBridge {
 
             Socket sock = null;
 
-            for (int attempt = 0; attempt < 120 && (whpxProc != null && whpxProc.isAlive()); attempt++) {
+            for (int attempt = 0; attempt < 120 && (proc != null && proc.isAlive()); attempt++) {
 
                 try {
 
@@ -1485,13 +1504,14 @@ public class WhpxEmulatorBridge {
 
                 try (BufferedReader br = new BufferedReader(new InputStreamReader(sock.getInputStream(), StandardCharsets.UTF_8));
 
-                     PrintWriter pw = new PrintWriter(new OutputStreamWriter(new FileOutputStream(consoleLog.toFile(), false), StandardCharsets.UTF_8), true)) {
+                     PrintWriter pw = new PrintWriter(new OutputStreamWriter(new FileOutputStream(consoleLog.toFile(), bootCount > 0), StandardCharsets.UTF_8), true)) {
 
                     String line;
 
                     while ((line = br.readLine()) != null) {
 
                         pw.println(line);
+                        if (line.contains("reboot: Restarting system")) guestRebooting = true;
 
                         System.out.println("[WHPX] " + line);
 
@@ -1529,11 +1549,11 @@ public class WhpxEmulatorBridge {
 
 
 
-        // Also drain whpxProc stdout to prevent pipe stalls
+        // Also drain proc stdout to prevent pipe stalls
 
         Thread qemuStdoutDrainer = new Thread(() -> {
 
-            try (BufferedReader br = new BufferedReader(new InputStreamReader(whpxProc.getInputStream(), StandardCharsets.UTF_8))) {
+            try (BufferedReader br = new BufferedReader(new InputStreamReader(proc.getInputStream(), StandardCharsets.UTF_8))) {
 
                 String line;
 
@@ -1585,7 +1605,7 @@ public class WhpxEmulatorBridge {
 
         Thread fallbackBringup = new Thread(() -> {
 
-            for (int i = 0; i < 40 && !adbOnline && whpxProc != null && whpxProc.isAlive(); i++) {
+            for (int i = 0; i < 40 && !adbOnline && proc != null && proc.isAlive(); i++) {
 
                 try {
 
@@ -1665,7 +1685,7 @@ public class WhpxEmulatorBridge {
 
 
 
-            while (whpxProc != null && whpxProc.isAlive()) {
+            while (proc != null && proc.isAlive()) {
 
 
 
@@ -1917,7 +1937,7 @@ public class WhpxEmulatorBridge {
 
 
 
-            while (whpxProc != null && whpxProc.isAlive()) {
+            while (proc != null && proc.isAlive()) {
 
 
 
@@ -1998,6 +2018,8 @@ public class WhpxEmulatorBridge {
 
 
         postBootMonitor.start();
+        };
+        bootThreads.run();
 
 
 
@@ -2107,6 +2129,22 @@ public class WhpxEmulatorBridge {
 
 
         whpxProc.waitFor();
+        while (guestRebooting) {
+            // Restarting in place stalls (arch timer) or crawls (stimer), so start a fresh QEMU on
+            // the same ports: Studio, adb and the emulator window stay connected.
+            guestRebooting = false;
+            bootCount++;
+            adbOnline = false;
+            currentRotation = 0;
+            currentZAngle = 0f;
+            cachedEncodedSeq = -1;
+            System.out.println("[WhpxEmulatorBridge] Android restarted the device: starting QEMU again (boot " + (bootCount + 1) + ")");
+            Thread.sleep(300);
+            whpxProc = pb.start();
+            WhpxHostTuning.boostAndPin(whpxProc, "qemu", WhpxHostTuning.residentMbFor(ramMb));
+            bootThreads.run();
+            whpxProc.waitFor();
+        }
 
 
 
@@ -2984,6 +3022,8 @@ public class WhpxEmulatorBridge {
 
 
             String tagIds = cfg.getOrDefault("tag.ids", "");
+            isWear = cfg.getOrDefault("tag.ids", cfg.getOrDefault("tag.id", "")).contains("android-wear");
+            skinPath = "no".equalsIgnoreCase(cfg.getOrDefault("showDeviceFrame", "yes").trim()) ? null : cfg.get("skin.path");
 
 
 
@@ -8382,6 +8422,32 @@ public class WhpxEmulatorBridge {
 
 
 
+    private static final EmulatorControllerServiceImpl controllerService = new EmulatorControllerServiceImpl();
+    private static final WhpxStandaloneWindow.Host standaloneHost = new WhpxStandaloneWindow.Host() {
+        @Override public EmulatorControllerGrpc.EmulatorControllerImplBase controller() { return controllerService; }
+        @Override public int displayWidth() { return lcdWidth; }
+        @Override public int displayHeight() { return lcdHeight; }
+        @Override public boolean round() { return isWear && lcdWidth == lcdHeight; }
+        @Override public java.io.File skinDir() { return skinPath == null || skinPath.isBlank() ? null : new java.io.File(skinPath.trim()); }
+        @Override public void rotate(int quarterTurns) {
+            float z = currentZAngle + 90f * quarterTurns;
+            controllerService.setPhysicalModel(PhysicalModelValue.newBuilder()
+                    .setTarget(PhysicalModelValue.PhysicalType.ROTATION)
+                    .setValue(ParameterValue.newBuilder().addData(0f).addData(0f).addData(z).build())
+                    .build(), new StreamObserver<Empty>() {
+                        @Override public void onNext(Empty v) {}
+                        @Override public void onError(Throwable t) {}
+                        @Override public void onCompleted() {}
+                    });
+        }
+        @Override public void showExtendedControls(int x, int y) { extendedControls.show(0, x, y, true); }
+        @Override public void shutdown() {
+            System.out.println("[WhpxEmulatorBridge] Emulator window closed: shutting down");
+            if (whpxProc != null) whpxProc.destroyForcibly();
+            System.exit(0);
+        }
+        @Override public String title() { return "Android Emulator - " + avdId + ":" + consolePort; }
+    };
     private static final WhpxExtendedControls extendedControls = new WhpxExtendedControls(new WhpxExtendedControls.Host() {
         @Override public void setLocation(double lat, double lon, double alt) { applyGps(lat, lon, alt); }
         @Override public double[] location() { return new double[] { gpsLat, gpsLon, gpsAlt }; }
