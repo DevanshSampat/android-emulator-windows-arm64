@@ -3512,6 +3512,25 @@ public class WhpxEmulatorBridge {
         }
     }
 
+    // ext4 (0xEF53 at 1080) or f2fs (0xF2F52010 at 1024) superblock present.
+    private static boolean hasFilesystem(Path img) {
+        try (FileChannel ch = FileChannel.open(img, StandardOpenOption.READ)) {
+            ByteBuffer b = ByteBuffer.allocate(64).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            if (ch.read(b, 1024) < 58) return false;
+            return (b.getShort(56) & 0xffff) == 0xEF53 || b.getInt(0) == 0xF2F52010;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+    // Runs a tool to completion; throws on timeout or a non-zero exit.
+    private static void runTool(String name, int timeoutSec, String... cmd) throws Exception {
+        Process p = new ProcessBuilder(cmd).redirectErrorStream(true).redirectOutput(ProcessBuilder.Redirect.DISCARD).start();
+        if (!p.waitFor(timeoutSec, TimeUnit.SECONDS)) {
+            p.destroyForcibly();
+            throw new IOException(name + " did not finish in " + timeoutSec + " s");
+        }
+        if (p.exitValue() != 0) throw new IOException(name + " failed with exit code " + p.exitValue());
+    }
     private static void provisionAvdDisksAndInitrd() throws Exception {
 
 
@@ -3597,80 +3616,40 @@ public class WhpxEmulatorBridge {
 
 
 
-        // 3. userdata-qemu.img (re-provision if missing or if it's an empty <512KB stub)
-
-
-
+        // 3. userdata-qemu.img. userdata.img is the blank /data image it is converted from.
+        // mke2fs writes the ext4 superblock last, so an interrupted or still-running mke2fs leaves a
+        // full-size file with no filesystem. Android then neither mounts nor formats /data (vold:
+        // "No key found ... read_key failed in mountFstab", init_user0 fails, reboot to bootloader),
+        // and every boot loops. Studio's Wipe Data keeps userdata.img, so the bad image survived wipes.
+        // Both tools now write to a temp file renamed only on success, and a userdata.img without a
+        // filesystem is rebuilt together with the qcow2 made from it.
         Path userdataQcow2 = Paths.get(avdDir, "userdata-qemu.img");
-
-
-
-        if (!Files.exists(userdataQcow2) || Files.size(userdataQcow2) < 524288L) {
-
-            if (Files.exists(encSys)) {
-
-                prepareEncryptionKey(encSys, encAvd);
-
-            }
-
-
-
-            Path userdataRaw = Paths.get(avdDir, "userdata.img");
-
-
-
-            Path sysUserdata = Paths.get(sysDir, "userdata.img");
-
-
-
-            if (!Files.exists(userdataRaw) || Files.size(userdataRaw) < 50_000_000L) {
-
-
-
-                if (Files.exists(sysUserdata) && Files.size(sysUserdata) >= 50_000_000L) {
-
-
-
-                    Files.copy(sysUserdata, userdataRaw, StandardCopyOption.REPLACE_EXISTING);
-
-
-
-                } else {
-
-
-
-                    Files.deleteIfExists(userdataRaw);
-
-
-
-                    new ProcessBuilder(mke2fsExe, "-F", "-t", "ext4", "-O", "^orphan_file", "-b", blockSize, userdataRaw.toString(), "10240M")
-
-
-
-                        .start().waitFor(30, TimeUnit.SECONDS);
-
-
-
-                }
-
-
-
-            }
-
-
-
+        Path userdataRaw = Paths.get(avdDir, "userdata.img");
+        Path sysUserdata = Paths.get(sysDir, "userdata.img");
+        boolean rawOk = Files.exists(userdataRaw) && Files.size(userdataRaw) >= 50_000_000L && hasFilesystem(userdataRaw);
+        if (Files.exists(userdataRaw) && !rawOk) {
+            System.out.println("[WhpxEmulatorBridge] " + userdataRaw + " has no filesystem (interrupted mke2fs?): rebuilding it and userdata-qemu.img");
             Files.deleteIfExists(userdataQcow2);
-
-
-
-            new ProcessBuilder(qemuImgExe, "convert", "-f", "raw", "-O", "qcow2", userdataRaw.toString(), userdataQcow2.toString())
-
-
-
-                .start().waitFor(60, TimeUnit.SECONDS);
-
-
-
+        }
+        if (!Files.exists(userdataQcow2) || Files.size(userdataQcow2) < 524288L) {
+            if (Files.exists(encSys)) {
+                prepareEncryptionKey(encSys, encAvd);
+            }
+            if (!rawOk) {
+                Path rawTmp = Paths.get(avdDir, "userdata.img.tmp");
+                Files.deleteIfExists(rawTmp);
+                if (Files.exists(sysUserdata) && Files.size(sysUserdata) >= 50_000_000L && hasFilesystem(sysUserdata)) {
+                    Files.copy(sysUserdata, rawTmp, StandardCopyOption.REPLACE_EXISTING);
+                } else {
+                    runTool("mke2fs", 600, mke2fsExe, "-F", "-t", "ext4", "-O", "^orphan_file", "-b", blockSize, rawTmp.toString(), "10240M");
+                }
+                if (!hasFilesystem(rawTmp)) throw new IOException("mke2fs produced no ext4 filesystem in " + rawTmp);
+                Files.move(rawTmp, userdataRaw, StandardCopyOption.REPLACE_EXISTING);
+            }
+            Path qcowTmp = Paths.get(avdDir, "userdata-qemu.img.tmp");
+            Files.deleteIfExists(qcowTmp);
+            runTool("qemu-img convert", 600, qemuImgExe, "convert", "-f", "raw", "-O", "qcow2", userdataRaw.toString(), qcowTmp.toString());
+            Files.move(qcowTmp, userdataQcow2, StandardCopyOption.REPLACE_EXISTING);
         }
 
 

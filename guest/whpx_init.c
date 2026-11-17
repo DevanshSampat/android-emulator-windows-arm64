@@ -21,6 +21,7 @@
 #include <signal.h>
 #include <dirent.h>
 #include <sys/xattr.h>
+#include <sys/swap.h>
 #include <sys/time.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
@@ -930,6 +931,138 @@ static void start_gfx_forwarder(void) {
     }
 }
 
+/* Android shields its own daemons from the kernel OOM killer (oom_score_adj -1000/-900), so
+ * in a full guest the killer picks the only unshielded processes: ours. Losing gfx_forwarder
+ * freezes the display for good; losing this supervisor loses adbd and eth0 upkeep. Every
+ * helper is forked from here and inherits the value. Android then recovers by killing
+ * system_server (-900) and restarting, which it knows how to do. */
+static void shield_from_oom_killer(void) {
+    int fd = openat(g_proc_fd, "self/oom_score_adj", O_WRONLY | O_CLOEXEC);
+    if (fd < 0 || write(fd, "-1000", 5) != 5) klog("oom_score_adj -1000 failed");
+    if (fd >= 0) close(fd);
+}
+
+/* Android turns on zram swap with swapon_all only when boot completes. A first boot (package
+ * scan, dexopt, Play services) in a 2 GB guest can run out of memory before then. Turn on the
+ * same zram0 now, at the size every image's fstab asks for (75% of RAM). swapon_all later finds
+ * zram0 busy, logs it and skips it; the swap stays on. */
+static int enable_early_zram(void) {
+    if (access("/sys/block/zram0/disksize", W_OK) != 0) {
+        klog("early zram: no /sys/block/zram0 (zram module not loaded)");
+        return 0;
+    }
+    char buf[64] = {0};
+    int fd = open("/sys/block/zram0/disksize", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) { read(fd, buf, sizeof(buf) - 1); close(fd); }
+    if (atoll(buf) > 0) return 0;  /* already set up (not by us) */
+    long long mem_kb = 0;
+    FILE* f = fopen("/proc/meminfo", "re");
+    if (f) {
+        char line[128];
+        while (fgets(line, sizeof(line), f))
+            if (sscanf(line, "MemTotal: %lld kB", &mem_kb) == 1) break;
+        fclose(f);
+    }
+    if (mem_kb <= 0) { klog("early zram: MemTotal unknown"); return 0; }
+    /* lz4 when the kernel has it (Android's choice too); otherwise keep the default. */
+    fd = open("/sys/block/zram0/comp_algorithm", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        char algs[256] = {0};
+        read(fd, algs, sizeof(algs) - 1);
+        close(fd);
+        if (strstr(algs, "lz4")) {
+            fd = open("/sys/block/zram0/comp_algorithm", O_WRONLY | O_CLOEXEC);
+            if (fd >= 0) { write(fd, "lz4", 3); close(fd); }
+        }
+    }
+    char size[32];
+    int n = snprintf(size, sizeof(size), "%lld", mem_kb * 1024 / 4 * 3 / 4096 * 4096);
+    fd = open("/sys/block/zram0/disksize", O_WRONLY | O_CLOEXEC);
+    if (fd < 0 || write(fd, size, n) != n) {
+        klog("early zram: cannot set disksize");
+        if (fd >= 0) close(fd);
+        return 0;
+    }
+    close(fd);
+    /* mkswap by hand (toybox mkswap fails this early): one page, "SWAPSPACE2" at its end,
+     * version 1 and the last usable page at 1024. Page size is the kernel's (4 or 16 KB). */
+    long page = sysconf(_SC_PAGESIZE);
+    unsigned char* hdr = calloc(1, page);
+    if (!hdr) return 0;
+    unsigned int info[2] = { 1, (unsigned int)(atoll(size) / page - 1) };
+    memcpy(hdr + 1024, info, sizeof(info));
+    memcpy(hdr + page - 10, "SWAPSPACE2", 10);
+    fd = open("/dev/block/zram0", O_WRONLY | O_CLOEXEC);
+    int ok = fd >= 0 && pwrite(fd, hdr, page, 0) == page && fsync(fd) == 0;
+    if (fd >= 0) close(fd);
+    free(hdr);
+    if (!ok) { klog("early zram: cannot write swap header"); return 0; }
+    if (swapon("/dev/block/zram0", 0) != 0) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "early zram: swapon failed: %s", strerror(errno));
+        klog(msg);
+        return 0;
+    }
+    char msg[96];
+    snprintf(msg, sizeof(msg), "early zram: %s bytes of swap on zram0", size);
+    klog(msg);
+    return 1;
+}
+
+/* Output of getprop NAME (no shell on the path popen() uses). */
+static void get_prop(const char* name, char* out, size_t len) {
+    out[0] = 0;
+    int fds[2];
+    if (pipe(fds) != 0) return;
+    pid_t p = fork();
+    if (p == 0) {
+        dup2(fds[1], 1);
+        close(fds[0]);
+        close(fds[1]);
+        char* argv[] = { "/system/bin/getprop", (char*)name, NULL };
+        execv(argv[0], argv);
+        _exit(127);
+    }
+    close(fds[1]);
+    int n = 0, r;
+    while (n < (int)len - 1 && (r = read(fds[0], out + n, len - 1 - n)) > 0) n += r;
+    out[n > 0 ? n : 0] = 0;
+    close(fds[0]);
+    if (p > 0) waitpid(p, NULL, 0);
+}
+
+/* While Android boots, early swap is only an emergency valve: swappiness 0 makes the kernel
+ * swap only once page cache is nearly gone. At the default 60 it pushed SurfaceFlinger,
+ * SystemUI and the launcher into zram during boot (1 GB out, 600 MB back in within two
+ * minutes on a 3 GB guest), and swap-ins on the UI path cost frames. Android itself enables
+ * zram only when boot completes, at the kernel's swappiness; restore that then. */
+static void boot_time_swappiness(void) {
+    char old[16] = {0};
+    int fd = open("/proc/sys/vm/swappiness", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    read(fd, old, sizeof(old) - 1);
+    close(fd);
+    if (atoi(old) <= 0) return;
+    fd = open("/proc/sys/vm/swappiness", O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    write(fd, "0", 1);
+    close(fd);
+    char v[16];
+    for (int i = 0; i < 1800; i++) {  /* give up after an hour */
+        get_prop("sys.boot_completed", v, sizeof(v));
+        if (v[0] == '1') break;
+        sleep(2);
+    }
+    fd = open("/proc/sys/vm/swappiness", O_WRONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        write(fd, old, strcspn(old, "\n"));
+        close(fd);
+    }
+    char msg[64];
+    snprintf(msg, sizeof(msg), "early zram: boot done, swappiness back to %d", atoi(old));
+    klog(msg);
+}
+
 static void run_supervisor(void) {
     // Mount proc and devtmpfs in daemon's early rootfs
     mkdir("/proc", 0755);
@@ -938,6 +1071,7 @@ static void run_supervisor(void) {
     mount("devtmpfs", "/dev", "devtmpfs", 0, NULL);
     g_kmsg_fd = open("/dev/kmsg", O_WRONLY | O_CLOEXEC);
     g_proc_fd = open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    shield_from_oom_killer();
 
     klog("Supervisor starting in background daemon");
 
@@ -1006,6 +1140,12 @@ static void run_supervisor(void) {
     hide_multidisplay();
     allow_pipe_syscalls();
     start_gfx_forwarder();
+    if (fork() == 0) {
+        /* ueventd may not have created the node yet; do not hold up the supervisor. */
+        for (int i = 0; i < 300 && access("/dev/block/zram0", F_OK) != 0; i++) usleep(100000);
+        if (enable_early_zram()) boot_time_swappiness();
+        _exit(0);
+    }
 
     apply_boot_density();
 
