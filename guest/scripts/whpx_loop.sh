@@ -242,7 +242,8 @@ while true; do
       wm_size=$(wm size 2>/dev/null)
       panel_w=$(echo "$wm_size" | grep "^Physical size" | sed "s/.*: //;s/x.*//")
       ui_w=$(echo "$wm_size" | grep "^Override size" | sed "s/.*: //;s/x.*//")
-      if [ -n "$panel_w" ] && [ -n "$ui_w" ] && [ "$ui_w" -lt "$panel_w" ]; then
+      # Not on a folded foldable: its narrower size is the cover screen, at the same density.
+      if [ "$(getprop whpx.fold)" != 1 ] && [ -n "$panel_w" ] && [ -n "$ui_w" ] && [ "$ui_w" -lt "$panel_w" ]; then
         boot_density=$((boot_density * ui_w / panel_w))
       fi
       if ! wm density 2>/dev/null | tail -1 | grep -q ": $boot_density"; then

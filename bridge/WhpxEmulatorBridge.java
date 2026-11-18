@@ -321,6 +321,9 @@ public class WhpxEmulatorBridge {
         int maxW = req.getWidth() > 0 ? req.getWidth() : baseW;
         int maxH = req.getHeight() > 0 ? req.getHeight() : baseH;
         double scale = Math.min((double) maxW / baseW, (double) maxH / baseH);
+        // Folded, the viewer shows only the cover screen, so it needs more of the panel's pixels.
+        int[] fold = WhpxFold.overrideSize() != null ? overrideArea(curRot) : null;
+        if (fold != null) scale = Math.min((double) maxW / fold[2], (double) maxH / fold[3]);
         int w = 0, h = 0;
         if (scale < 0.75) {
             w = ((int) Math.ceil(lcdWidth * scale) + 1) & ~1;
@@ -386,12 +389,13 @@ public class WhpxEmulatorBridge {
         return Files.isRegularFile(bundled) ? bundled.toString() : "python";
     }
 
-    private static volatile double touchScale = 1.0;
+    // The guest's "wm size" override, 0 when there is none (read every 5 s).
+    private static volatile int overrideW = 0, overrideH = 0;
 
     private static void startTouchScaleWatcher() {
         Thread t = new Thread(() -> {
             Pattern physical = Pattern.compile("Physical size: (\\d+)x");
-            Pattern override = Pattern.compile("Override size: (\\d+)x");
+            Pattern override = Pattern.compile("Override size: (\\d+)x(\\d+)");
             while (true) {
                 try {
                     Thread.sleep(5000);
@@ -403,11 +407,23 @@ public class WhpxEmulatorBridge {
                     if (!ph.find()) continue;
                     int panel = Integer.parseInt(ph.group(1));
                     Matcher ov = override.matcher(out);
-                    int ui = ov.find() ? Integer.parseInt(ov.group(1)) : panel;
-                    double scale = (ui > 0 && ui < panel) ? (double) ui / panel : 1.0;
-                    if (scale != touchScale) {
-                        touchScale = scale;
-                        System.out.println("[WhpxEmulatorBridge] Touch scale " + ui + "/" + panel);
+                    // Foldables: Android rescales the density whenever the screen size or a
+                    // framework overlay changes; put the device's own back if that happened.
+                    int want = WhpxFold.expectedDensity();
+                    if (want > 0) {
+                        Process pd = new ProcessBuilder(sdkDir + "\\platform-tools\\adb.exe", "-s", emulatorSerial, "shell",
+                            "d=$(wm density | tail -1); [ \"$d\" = \"Override density: " + want + "\" ] || { wm density " + want + "; echo reset $d; }")
+                            .redirectErrorStream(true).start();
+                        String dout = new String(pd.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+                        pd.waitFor();
+                        if (dout.startsWith("reset")) System.out.println("[WhpxFold] density was " + dout.substring(6) + "; set " + want);
+                    }
+                    boolean has = ov.find();
+                    int w = has ? Integer.parseInt(ov.group(1)) : 0, h = has ? Integer.parseInt(ov.group(2)) : 0;
+                    if (w != overrideW || h != overrideH) {
+                        overrideW = w;
+                        overrideH = h;
+                        System.out.println("[WhpxEmulatorBridge] Guest screen " + (has ? w + "x" + h : "not overridden") + " on panel width " + panel);
                     }
                 } catch (InterruptedException e) {
                     return;
@@ -418,14 +434,55 @@ public class WhpxEmulatorBridge {
         t.start();
     }
 
+    /**
+     * Where the guest's screen is on the panel when "wm size" overrides it: scaled to fit and
+     * centred. Returns {x, y, width, height} in panel pixels for rotation rot, or null.
+     */
+    private static int[] overrideArea(int rot) {
+        int[] fold = WhpxFold.overrideSize();
+        int uw = fold != null ? fold[0] : overrideW, uh = fold != null ? fold[1] : overrideH;
+        if (uw <= 0 || uh <= 0) return null;
+        int pw = lcdWidth, ph = lcdHeight;
+        if (rot % 2 == 1) { int t = pw; pw = ph; ph = t; t = uw; uw = uh; uh = t; }
+        double s = Math.min((double) pw / uw, (double) ph / uh);
+        int cw = (int) Math.round(uw * s), ch = (int) Math.round(uh * s);
+        if (cw == pw && ch == ph && uw == pw) return null;
+        return new int[] { (pw - cw) / 2, (ph - ch) / 2, cw, ch, uw, uh };
+    }
+
+    /** A folded device shows only its cover screen: tell Studio where it is in the frame. */
+    private static ImageFormat foldFormat(int rot) {
+        if (WhpxFold.overrideSize() == null) return ImageFormat.getDefaultInstance();
+        int[] a = overrideArea(rot);
+        if (a == null) return ImageFormat.getDefaultInstance();
+        // Offsets 0, as Google's emulator sends them: the image is already just the cover screen,
+        // and Studio drops clicks outside this rectangle after making them relative to it, so a
+        // real offset lost every click on the left part of the screen.
+        return ImageFormat.newBuilder().setFoldedDisplay(FoldedDisplay.newBuilder()
+            .setXOffset(0).setYOffset(0).setWidth(a[2]).setHeight(a[3]).build()).build();
+    }
+
+    /**
+     * Touches arrive in panel pixels; the guest takes them in its own (overridden) screen's pixels.
+     * The override may have another shape than the panel (a folded device's cover screen), so
+     * this removes the letterbox offset as well as scaling.
+     */
     private static String scaleTouch(String cmd) {
-        double scale = touchScale;
-        if (scale == 1.0 || !cmd.startsWith("T ")) return cmd;
+        if (!cmd.startsWith("T ")) return cmd;
+        int[] a = overrideArea(currentRotation);
+        if (a == null) return cmd;
         String[] f = cmd.split(" ");
         if (f.length != 4) return cmd;
         try {
-            return "T " + f[1] + " " + Math.round(Integer.parseInt(f[2]) * scale)
-                + " " + Math.round(Integer.parseInt(f[3]) * scale);
+            double s = (double) a[4] / a[2];
+            // Folded, clients get foldedDisplay and send touches relative to the cover screen,
+            // as Google's emulator expects; otherwise they are in panel pixels.
+            boolean relative = WhpxFold.overrideSize() != null;
+            long x = Math.round((Integer.parseInt(f[2]) - (relative ? 0 : a[0])) * s);
+            long y = Math.round((Integer.parseInt(f[3]) - (relative ? 0 : a[1])) * s);
+            x = Math.max(0, Math.min(a[4] - 1, x));
+            y = Math.max(0, Math.min(a[5] - 1, y));
+            return "T " + f[1] + " " + x + " " + y;
         } catch (NumberFormatException e) {
             return cmd;
         }
@@ -1980,6 +2037,13 @@ public class WhpxEmulatorBridge {
 
 
                             applyPostBootSettings(adbExe);
+                            if (WhpxFold.foldable()) {
+                                final String serialNow = emulatorSerial;
+                                Thread fold = new Thread(() -> WhpxFold.ensureGuest(adbExe, serialNow, bridgeDir,
+                                        EmulatorControllerServiceImpl::dispatchGuestInput), "WhpxFoldSetup");
+                                fold.setDaemon(true);
+                                fold.start();
+                            }
 
 
 
@@ -2137,6 +2201,7 @@ public class WhpxEmulatorBridge {
             adbOnline = false;
             currentRotation = 0;
             currentZAngle = 0f;
+            WhpxFold.onGuestRestart();
             cachedEncodedSeq = -1;
             System.out.println("[WhpxEmulatorBridge] Android restarted the device: starting QEMU again (boot " + (bootCount + 1) + ")");
             Thread.sleep(300);
@@ -2453,15 +2518,15 @@ public class WhpxEmulatorBridge {
 
 
 
-                "setprop persist.sys.timezone Asia/Kolkata; " +
+                // Through the time zone service, so the clock in the status bar is told. Setting
+                // persist.sys.timezone directly first made the service see no change: it kept GMT.
+                "cmd time_zone_detector suggest_manual_time_zone --zone_id " + hostTimeZone() + " || cmd alarm set-timezone " + hostTimeZone() + "; " +
 
 
 
-                "cmd time_zone_detector suggest_manual_time_zone --zone_id Asia/Kolkata; " +
 
 
 
-                "service call alarm 3 s16 Asia/Kolkata; " +
 
 
 
@@ -2804,7 +2869,7 @@ public class WhpxEmulatorBridge {
 
                     sendSerialSlow("sh -c \"echo '#!/system/bin/sh' > /dev/whpx_r && echo 'while true; do sleep 3600; done' >> /dev/whpx_r && chmod 755 /dev/whpx_r && mount -o bind /dev/whpx_r /vendor/bin/hw/android.hardware.radio-service.ranchu 2>/dev/null\"\r\n");
 
-                    sendSerialSlow("sh -c \"for i in 0 1 2 3 4 5; do touch /dev/hvc$i; chmod 666 /dev/hvc$i; done; setprop persist.sys.timezone Asia/Kolkata\"\r\n");
+                    sendSerialSlow("sh -c \"for i in 0 1 2 3 4 5; do touch /dev/hvc$i; chmod 666 /dev/hvc$i; done\"\r\n");
 
                     sendSerialSlow("sh -c \"(while [ ! -f /data/local/tmp/start_android_ui.sh ]; do sleep 1; done; sh /data/local/tmp/start_android_ui.sh) &\"\r\n");
 
@@ -3007,7 +3072,23 @@ public class WhpxEmulatorBridge {
 
             // The RAM set in Device Manager. Guests now have zram (compressed swap), so the
             // 3 GB floor that once covered for its absence would cost the host 1 GB for nothing.
-            ramMb = Math.max(2048, Math.min(8192, rawRam));
+            // A quarter of the host's RAM, or the RAM set in Device Manager if that is more; 2 to 8 GB.
+            // Studio creates most devices with 2 GB, which left Android 17 phones and foldables
+            // swapping to zram and janking. Wear keeps its own setting: a watch has no use for 4 GB.
+            boolean wearAvd = cfg.getOrDefault("tag.ids", cfg.getOrDefault("tag.id", "")).contains("android-wear");
+            long hostRamMb = 0;
+            try {
+                java.lang.management.OperatingSystemMXBean os = java.lang.management.ManagementFactory.getOperatingSystemMXBean();
+                if (os instanceof com.sun.management.OperatingSystemMXBean sun) hostRamMb = sun.getTotalMemorySize() >> 20;
+            } catch (Throwable ignored) {}
+            // Rounded to 256 MB: Windows reports a 16 GB PC as about 15.6 GB, which still gives 4 GB.
+            int quarter = (int) (Math.round(hostRamMb / 4.0 / 256.0) * 256);
+            int wantedRam = wearAvd ? rawRam : Math.max(rawRam, quarter);
+            ramMb = Math.max(2048, Math.min(8192, wantedRam));
+            System.out.println("[WhpxEmulatorBridge] RAM: host " + hostRamMb + " MB, Device Manager " + rawRam + " MB -> guest " + ramMb + " MB");
+            WhpxFold.configure(cfg, lcdDensity);
+            String foldSkin = cfg.get("skin.path");
+            WhpxFold.loadCoverCutout(foldSkin == null || foldSkin.isBlank() ? null : new File(foldSkin.trim()), lcdWidth);
 
 
 
@@ -3135,6 +3216,20 @@ public class WhpxEmulatorBridge {
 
 
 
+    /** The PC's time zone as an IANA id for Android, e.g. Asia/Kolkata for India Standard Time. */
+    private static String hostTimeZone() {
+        String id;
+        try { id = java.time.ZoneId.systemDefault().normalized().getId(); } catch (Exception e) { return "Etc/UTC"; }
+        // Windows maps some zones to older names; Android knows them, but shows the current ones.
+        switch (id) {
+            case "Asia/Calcutta": return "Asia/Kolkata";
+            case "Asia/Katmandu": return "Asia/Kathmandu";
+            case "Asia/Saigon": return "Asia/Ho_Chi_Minh";
+            case "Asia/Rangoon": return "Asia/Yangon";
+            case "Z": case "UTC": case "GMT": return "Etc/UTC";
+            default: return id.matches("[A-Za-z_]+(/[A-Za-z0-9_+\\-]+)*") ? id : "Etc/UTC";
+        }
+    }
     private static int parseIntOrDefault(String s, int def) {
 
 
@@ -4634,6 +4729,8 @@ public class WhpxEmulatorBridge {
 
 
 
+        // Foldables list their hinge and postures, so Studio offers Closed / Half-open / Open.
+        hwQemuContent = WhpxFold.patchIni(hwQemuContent);
         Files.write(hwQemuIni, hwQemuContent.getBytes(StandardCharsets.UTF_8));
 
 
@@ -4989,7 +5086,40 @@ public class WhpxEmulatorBridge {
         }
     }
 
+    /**
+     * The screen image for a client. A folded device shows only its cover screen: like Google's
+     * emulator, the image is just that part of the panel, and foldedDisplay says where it is.
+     * Studio scales the posture's device frame to the image, so a full-panel image stretched
+     * the closed frame across the inner screen's width.
+     */
     private static Image buildScreenImage(ImageFormat req, int seq) {
+        int rot = currentRotation;
+        int[] a = WhpxFold.overrideSize() != null ? overrideArea(rot) : null;
+        if (a == null) return buildFullImage(req, seq);
+        int pw = (rot % 2 == 0) ? lcdWidth : lcdHeight, ph = (rot % 2 == 0) ? lcdHeight : lcdWidth;
+        int maxW = req.getWidth() > 0 ? req.getWidth() : a[2], maxH = req.getHeight() > 0 ? req.getHeight() : a[3];
+        double s = Math.min(1.0, Math.min((double) maxW / a[2], (double) maxH / a[3]));
+        Image full = buildFullImage(req.toBuilder()
+            .setWidth((int) Math.ceil(pw * s)).setHeight((int) Math.ceil(ph * s)).build(), seq);
+        int fw = full.getWidth(), fh = full.getHeight();
+        if (fw <= 0 || fh <= 0) return full;
+        double k = (double) fw / pw;
+        int cx = Math.max(0, (int) Math.round(a[0] * k)), cy = Math.max(0, (int) Math.round(a[1] * k));
+        int cw = Math.max(2, Math.min(fw - cx, (int) Math.round(a[2] * k)) & ~1);
+        int ch = Math.max(2, Math.min(fh - cy, (int) Math.round(a[3] * k)) & ~1);
+        int bpp = full.getImage().size() / (fw * fh);
+        if (bpp < 3) return full;
+        byte[] src = full.getImage().toByteArray();
+        byte[] out = new byte[cw * ch * bpp];
+        for (int y = 0; y < ch; y++) {
+            System.arraycopy(src, ((cy + y) * fw + cx) * bpp, out, y * cw * bpp, cw * bpp);
+        }
+        ImageFormat f = full.getFormat().toBuilder().setWidth(cw).setHeight(ch).build();
+        return full.toBuilder().setFormat(f).setWidth(cw).setHeight(ch)
+            .setImage(com.android.tools.idea.protobuf.UnsafeByteOperations.unsafeWrap(out)).build();
+    }
+
+    private static Image buildFullImage(ImageFormat req, int seq) {
 
         if (frameMbb == null) initFrameMbb();
 
@@ -5082,6 +5212,7 @@ public class WhpxEmulatorBridge {
                 .setDisplay(req.getDisplay())
 
                 .setRotation(protoRot)
+                .mergeFrom(foldFormat(curRot))
 
                 .build();
 
@@ -5574,6 +5705,7 @@ public class WhpxEmulatorBridge {
             .setDisplay(req.getDisplay())
 
             .setRotation(protoRot)
+            .mergeFrom(foldFormat(curRot))
 
             .build();
 
@@ -6097,6 +6229,11 @@ public class WhpxEmulatorBridge {
 
 
                     .build());
+                if (WhpxFold.foldable()) {
+                    resp.onNext(Notification.newBuilder()
+                        .setPosture(Posture.newBuilder().setValueValue(WhpxFold.posture()).build()).build());
+                }
+                notificationObservers.add(resp);
 
 
 
@@ -7750,7 +7887,10 @@ public class WhpxEmulatorBridge {
                         mouseLastX = x;
                         mouseLastY = y;
                         sendDirectInput("T 0 " + x + " " + y);
-                        WhpxDragSmoother.onDown(x, y, maxW, maxH, curRot);
+                        // Folded, Studio's coordinates span the cover screen, and Studio draws it at
+                        // another scale: the smoother must not reuse what it learned for the open panel.
+                        int[] foldArea = WhpxFold.overrideSize() != null ? overrideArea(curRot) : null;
+                        WhpxDragSmoother.onDown(x, y, foldArea != null ? foldArea[2] : maxW, foldArea != null ? foldArea[3] : maxH, curRot);
                     } else if (!WhpxDragSmoother.onMove(x, y) && (x != mouseLastX || y != mouseLastY)) {
                         mouseLastX = x;
                         mouseLastY = y;
@@ -8046,6 +8186,39 @@ public class WhpxEmulatorBridge {
 
 
         private static final java.util.List<StreamObserver<PhysicalModelValue>> physicalModelObservers = new java.util.concurrent.CopyOnWriteArrayList<>();
+        private static final java.util.List<StreamObserver<PhysicalModelValue>> hingeObservers = new java.util.concurrent.CopyOnWriteArrayList<>();
+        private static final java.util.List<StreamObserver<Notification>> notificationObservers = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+        private static PhysicalModelValue hingeValue() {
+            return PhysicalModelValue.newBuilder()
+                .setTarget(PhysicalModelValue.PhysicalType.HINGE_ANGLE0)
+                .setStatus(PhysicalModelValue.State.OK)
+                .setValue(ParameterValue.newBuilder().addData(WhpxFold.angle()).build())
+                .build();
+        }
+
+        /** Studio folded or unfolded the device: tell Android, then Studio's posture menu. */
+        private static void onHingeAngle(float angle) {
+            if (!WhpxFold.foldable()) return;
+            boolean changed = WhpxFold.setAngle(angle);
+            System.out.println("[WhpxFold] hinge angle " + angle + " -> posture " + WhpxFold.posture() + (changed ? "" : " (unchanged)"));
+            PhysicalModelValue v = hingeValue();
+            for (StreamObserver<PhysicalModelValue> obs : hingeObservers) {
+                try { obs.onNext(v); } catch (Throwable t) { hingeObservers.remove(obs); }
+            }
+            if (!changed) return;
+            String cmds = WhpxFold.guestCommands();
+            if (cmds != null) dispatchGuestInput(cmds);
+            notifyPosture();
+        }
+
+        static void notifyPosture() {
+            Notification n = Notification.newBuilder()
+                .setPosture(Posture.newBuilder().setValueValue(WhpxFold.posture()).build()).build();
+            for (StreamObserver<Notification> obs : notificationObservers) {
+                try { obs.onNext(n); } catch (Throwable t) { notificationObservers.remove(obs); }
+            }
+        }
 
 
 
@@ -8053,6 +8226,9 @@ public class WhpxEmulatorBridge {
 
         public void setPhysicalModel(PhysicalModelValue req, StreamObserver<Empty> resp) {
 
+            if (req != null && req.getTarget() == PhysicalModelValue.PhysicalType.HINGE_ANGLE0 && req.getValue().getDataCount() >= 1) {
+                onHingeAngle(req.getValue().getData(0));
+            }
             if (req != null && req.getTarget() == PhysicalModelValue.PhysicalType.ROTATION && req.getValue().getDataCount() >= 3) {
 
                 float z = req.getValue().getData(2);
@@ -8128,6 +8304,11 @@ public class WhpxEmulatorBridge {
         @Override
 
         public void getPhysicalModel(PhysicalModelValue req, StreamObserver<PhysicalModelValue> resp) {
+            if (req != null && req.getTarget() == PhysicalModelValue.PhysicalType.HINGE_ANGLE0) {
+                resp.onNext(hingeValue());
+                resp.onCompleted();
+                return;
+            }
 
             resp.onNext(PhysicalModelValue.newBuilder()
 
@@ -8148,6 +8329,13 @@ public class WhpxEmulatorBridge {
         @Override
 
         public void streamPhysicalModel(PhysicalModelValue req, StreamObserver<PhysicalModelValue> resp) {
+            if (req != null && req.getTarget() == PhysicalModelValue.PhysicalType.HINGE_ANGLE0) {
+                try {
+                    resp.onNext(hingeValue());
+                    hingeObservers.add(resp);
+                } catch (Throwable ignored) {}
+                return;
+            }
 
             try {
 

@@ -82,7 +82,7 @@ final class WhpxStandaloneWindow {
     private int lastRotation = -1;
     private StreamObserver<InputEvent> input;
     private JPanel buttons;
-    private WhpxSkin skin;
+    private WhpxSkin skin, skinOpen, skinClosed;
 
     private WhpxStandaloneWindow(Host host) {
         this.host = host;
@@ -130,7 +130,20 @@ final class WhpxStandaloneWindow {
             }
             next ^= 1;
             int rot = img.getFormat().getRotation().getRotationValue();
-            panel.show(dst, rot);
+            ImageFormat f = img.getFormat();
+            if (f.hasFoldedDisplay() && f.getFoldedDisplay().getWidth() > 0) {
+                // Folded: only the cover screen is shown, and touches are relative to it.
+                com.android.emulator.control.FoldedDisplay fd = f.getFoldedDisplay();
+                // The bridge sends just the cover screen; crop only if the image is the whole panel.
+                boolean already = Math.abs((double) w / h - (double) fd.getWidth() / fd.getHeight()) < 0.02;
+                int pw = (rot % 2 == 0) ? host.displayWidth() : host.displayHeight();
+                double sx = (double) w / pw;
+                Rectangle crop = already ? null : new Rectangle((int) Math.round(fd.getXOffset() * sx), (int) Math.round(fd.getYOffset() * sx),
+                        (int) Math.round(fd.getWidth() * sx), (int) Math.round(fd.getHeight() * sx));
+                panel.show(dst, rot, crop, fd.getWidth(), fd.getHeight());
+            } else {
+                panel.show(dst, rot, null, 0, 0);
+            }
         }
 
         @Override public void onError(Throwable t) {}
@@ -176,7 +189,12 @@ final class WhpxStandaloneWindow {
         root.add(toolbar(), BorderLayout.EAST);
         frame.setContentPane(root);
 
-        skin = WhpxSkin.load(host.skinDir());
+        // Foldables keep their skins in default/ and closed/ under the skin folder.
+        java.io.File dir = host.skinDir();
+        skinOpen = WhpxSkin.load(dir);
+        if (skinOpen == null && dir != null) skinOpen = WhpxSkin.load(new java.io.File(dir, "default"));
+        skinClosed = dir != null ? WhpxSkin.load(new java.io.File(dir, "closed")) : null;
+        skin = skinOpen;
         // Size the device (with its frame) to about 80% of the screen height, keeping its aspect ratio.
         double aw = skin != null ? skin.width : host.displayWidth();
         double ah = skin != null ? skin.height : host.displayHeight();
@@ -315,6 +333,8 @@ final class WhpxStandaloneWindow {
     private final class DevicePanel extends JComponent {
         private volatile BufferedImage image;
         private volatile int rotation;
+        private volatile Rectangle crop;          // part of the image to show, null for all of it
+        private volatile int foldW, foldH;        // folded screen size in panel pixels, 0 when open
         private boolean pressed;
 
         DevicePanel() {
@@ -362,9 +382,13 @@ final class WhpxStandaloneWindow {
             });
         }
 
-        void show(BufferedImage img, int rot) {
+        void show(BufferedImage img, int rot, Rectangle crop, int foldW, int foldH) {
             image = img;
             rotation = rot;
+            this.crop = crop;
+            this.foldW = foldW;
+            this.foldH = foldH;
+            skin = (foldW > 0 && skinClosed != null) ? skinClosed : skinOpen;
             repaint();
             if (rot != lastRotation) {
                 boolean turned = lastRotation >= 0 && (rot % 2) != (lastRotation % 2);
@@ -409,8 +433,8 @@ final class WhpxStandaloneWindow {
                 return new Rectangle((int) Math.round(f.x + d.getX() * s), (int) Math.round(f.y + d.getY() * s),
                         (int) Math.round(d.getWidth() * s), (int) Math.round(d.getHeight() * s));
             }
-            double dw = (rot % 2 == 0) ? host.displayWidth() : host.displayHeight();
-            double dh = (rot % 2 == 0) ? host.displayHeight() : host.displayWidth();
+            double dw = foldW > 0 ? foldW : (rot % 2 == 0) ? host.displayWidth() : host.displayHeight();
+            double dh = foldW > 0 ? foldH : (rot % 2 == 0) ? host.displayHeight() : host.displayWidth();
             double s = Math.min(getWidth() / dw, getHeight() / dh);
             int w = (int) Math.round(dw * s), h = (int) Math.round(dh * s);
             return new Rectangle((getWidth() - w) / 2, (getHeight() - h) / 2, w, h);
@@ -420,13 +444,19 @@ final class WhpxStandaloneWindow {
             Rectangle r = screenRect();
             if (r.width <= 0 || r.height <= 0) return;
             int rot = rotation;
-            int dw = (rot % 2 == 0) ? host.displayWidth() : host.displayHeight();
-            int dh = (rot % 2 == 0) ? host.displayHeight() : host.displayWidth();
+            int dw = foldW > 0 ? foldW : (rot % 2 == 0) ? host.displayWidth() : host.displayHeight();
+            int dh = foldW > 0 ? foldH : (rot % 2 == 0) ? host.displayHeight() : host.displayWidth();
             int x = (int) Math.round((e.getX() - r.x) * (double) dw / r.width);
             int y = (int) Math.round((e.getY() - r.y) * (double) dh / r.height);
             send(InputEvent.newBuilder().setMouseEvent(MouseEvent.newBuilder()
                     .setX(Math.max(0, Math.min(dw - 1, x))).setY(Math.max(0, Math.min(dh - 1, y)))
                     .setButtons(buttons).build()).build());
+        }
+
+        private void drawScreen(Graphics2D g, BufferedImage img, Rectangle r) {
+            Rectangle c = crop;
+            if (c == null) g.drawImage(img, r.x, r.y, r.width, r.height, null);
+            else g.drawImage(img, r.x, r.y, r.x + r.width, r.y + r.height, c.x, c.y, c.x + c.width, c.y + c.height, null);
         }
 
         @Override
@@ -449,12 +479,12 @@ final class WhpxStandaloneWindow {
                     Rectangle2D.Double f = frameRect();
                     g.drawImage(skin.back(rot), (int) Math.round(f.x), (int) Math.round(f.y),
                             (int) Math.round(f.width), (int) Math.round(f.height), null);
-                    g.drawImage(img, r.x, r.y, r.width, r.height, null);
+                    drawScreen(g, img, r);
                     java.awt.image.BufferedImage m = skin.mask(rot);
                     if (m != null) g.drawImage(m, r.x, r.y, r.width, r.height, null);
                 } else {
                     if (host.round()) g.clip(new Ellipse2D.Double(r.x, r.y, r.width, r.height));
-                    g.drawImage(img, r.x, r.y, r.width, r.height, null);
+                    drawScreen(g, img, r);
                 }
             }
             g.dispose();
