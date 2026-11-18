@@ -458,8 +458,11 @@ public class WhpxEmulatorBridge {
         if (f.length != 4) return cmd;
         try {
             double s = (double) a[4] / a[2];
-            long x = Math.round((Integer.parseInt(f[2]) - a[0]) * s);
-            long y = Math.round((Integer.parseInt(f[3]) - a[1]) * s);
+            // Folded, clients get foldedDisplay and send touches relative to the cover screen,
+            // as Google's emulator expects; otherwise they are in panel pixels.
+            boolean relative = WhpxFold.overrideSize() != null;
+            long x = Math.round((Integer.parseInt(f[2]) - (relative ? 0 : a[0])) * s);
+            long y = Math.round((Integer.parseInt(f[3]) - (relative ? 0 : a[1])) * s);
             x = Math.max(0, Math.min(a[4] - 1, x));
             y = Math.max(0, Math.min(a[5] - 1, y));
             return "T " + f[1] + " " + x + " " + y;
