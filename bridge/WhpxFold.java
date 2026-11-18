@@ -114,23 +114,104 @@ final class WhpxFold {
     /** Shell commands that put the guest in the current posture. */
     static String guestCommands() {
         if (!foldable || !guestReady) return null;
-        String reset = "wm size reset; wm density " + density;
+        // Android scales the density with the screen size, and does it again shortly after
+        // (when the device state's display layout applies), so keep setting it until it holds.
+        String keepDensity = "for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ \"$(wm density | tail -1)\" = \"Override density: " + density
+                + "\" ] || wm density " + density + "; sleep 1; done";
+        String innerCutout = "cmd overlay disable com.android.shell:WhpxCoverCutout >/dev/null 2>&1; "
+                + "cmd overlay disable com.android.shell:WhpxCoverCutoutRect >/dev/null 2>&1; ";
+        // Overlay changes reset the density too, so the cutout goes first and the density last.
         switch (posture) {
             case CLOSED:
-                return "cmd device_state state 0; "
-                        // Android recalculates the density just after a size change, so set it after that.
-                        + (outerW > 0 && outerH > 0 ? "wm size " + outerW + "x" + outerH + "; sleep 1; wm density " + density : reset);
+                if (outerW <= 0 || outerH <= 0) return "cmd device_state state 0";
+                return coverCutout() + "sleep 1; cmd device_state state 0; wm size " + outerW + "x" + outerH + "; " + keepDensity;
             case HALF_OPENED:
-                return "cmd device_state state 1; " + reset;
+                return innerCutout + "sleep 1; cmd device_state state 1; wm size reset; " + keepDensity;
             default:
-                return "cmd device_state state reset; " + reset;
+                return innerCutout + "sleep 1; cmd device_state state reset; wm size reset; " + keepDensity;
         }
+    }
+
+    private static String coverCutoutCmds, coverCutoutSetup;
+
+    /**
+     * The cover screen's camera cutout, from the hole in the closed skin's mask. Without it the
+     * inner screen's cutout (a corner hole) stays, and the system UI draws it on the cover screen.
+     * Android takes cutouts in panel pixels and scales them by the screen's width, so the hole's
+     * cover-screen position is scaled back up.
+     */
+    private static String coverCutout() {
+        return coverCutoutCmds == null ? "" : coverCutoutCmds;
+    }
+
+    static void loadCoverCutout(File skinDir, int lcdWidth) {
+        coverCutoutCmds = null;
+        if (!foldable || skinDir == null || outerW <= 0 || lcdWidth <= 0) return;
+        try {
+            File mask = new File(new File(skinDir, "closed"), "mask.webp");
+            if (!mask.isFile()) mask = new File(new File(skinDir, "closed"), "mask.png");
+            if (!mask.isFile()) return;
+            java.awt.image.BufferedImage m = javax.imageio.ImageIO.read(mask);
+            if (m == null || m.getWidth() != outerW) return;
+            int[] hole = interiorHole(m);
+            if (hole == null) return;
+            double s = (double) outerW / lcdWidth;
+            double r = (hole[2] - hole[0] + 1) / 2.0 / s, cx = (hole[0] + hole[2] + 1) / 2.0 / s, cy = (hole[1] + hole[3] + 1) / 2.0 / s;
+            String path = String.format(java.util.Locale.ROOT, "m %.1f,%.1f a %.1f,%.1f 0 0 0 %.1f,0 %.1f,%.1f 0 0 0 %.1f,0 z @left",
+                    cx + r, cy, r, r, -2 * r, r, r, 2 * r);
+            String rect = String.format(java.util.Locale.ROOT, "m %.1f,%.1f h %.1f v %.1f h %.1f z @left",
+                    cx - r, cy - r, 2 * r, 2 * r, -2 * r);
+            // Fabricated once per boot (re-registering an overlay applies late, about 14 s on,
+            // and resets the density then); folding only enables and disables them.
+            coverCutoutSetup = "cmd overlay fabricate --target android --name WhpxCoverCutout android:string/config_mainBuiltInDisplayCutout string \"" + path + "\" >/dev/null 2>&1; "
+                    + "cmd overlay fabricate --target android --name WhpxCoverCutoutRect android:string/config_mainBuiltInDisplayCutoutRectApproximation string \"" + rect + "\" >/dev/null 2>&1; ";
+            coverCutoutCmds = "cmd overlay enable com.android.shell:WhpxCoverCutout >/dev/null 2>&1; cmd overlay enable com.android.shell:WhpxCoverCutoutRect >/dev/null 2>&1; ";
+            System.out.println("[WhpxFold] cover screen cutout at " + hole[0] + "," + hole[1] + "-" + hole[2] + "," + hole[3]);
+        } catch (Exception e) {
+            System.out.println("[WhpxFold] no cover screen cutout: " + e);
+        }
+    }
+
+    /** Bounds {x0, y0, x1, y1} of the opaque blob in the mask's top fifth that touches no edge. */
+    private static int[] interiorHole(java.awt.image.BufferedImage m) {
+        int w = m.getWidth(), h = Math.min(m.getHeight(), m.getHeight() / 5);
+        boolean[] seen = new boolean[w * h];
+        java.util.ArrayDeque<int[]> stack = new java.util.ArrayDeque<>();
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                if (seen[y * w + x] || (m.getRGB(x, y) >>> 24) < 128) continue;
+                int x0 = x, x1 = x, y0 = y, y1 = y, n = 0;
+                boolean edge = false;
+                stack.push(new int[] { x, y });
+                seen[y * w + x] = true;
+                while (!stack.isEmpty()) {
+                    int[] p = stack.pop();
+                    n++;
+                    x0 = Math.min(x0, p[0]); x1 = Math.max(x1, p[0]); y0 = Math.min(y0, p[1]); y1 = Math.max(y1, p[1]);
+                    if (p[0] == 0 || p[1] == 0 || p[0] == w - 1 || p[1] == h - 1) edge = true;
+                    int[][] nb = { { p[0] + 1, p[1] }, { p[0] - 1, p[1] }, { p[0], p[1] + 1 }, { p[0], p[1] - 1 } };
+                    for (int[] q : nb) {
+                        if (q[0] < 0 || q[1] < 0 || q[0] >= w || q[1] >= h || seen[q[1] * w + q[0]]) continue;
+                        if ((m.getRGB(q[0], q[1]) >>> 24) < 128) continue;
+                        seen[q[1] * w + q[0]] = true;
+                        stack.push(q);
+                    }
+                }
+                if (!edge && n > 50 && x1 - x0 < w / 4) return new int[] { x0, y0, x1, y1 };
+            }
+        }
+        return null;
     }
 
     /** The cover screen's size while closed (the guest's screen then has this size), else null. */
     static int[] overrideSize() {
         if (!foldable || !guestReady || posture != CLOSED || outerW <= 0 || outerH <= 0) return null;
         return new int[] { outerW, outerH };
+    }
+
+    /** The density the guest should have once set up, or 0 when the bridge does not manage it. */
+    static int expectedDensity() {
+        return foldable && guestReady ? density : 0;
     }
 
     /** A new QEMU run starts open: Android's device state does not survive the restart. */
@@ -167,6 +248,9 @@ final class WhpxFold {
         try {
             // adb can drop the device for a moment around boot (it reconnects): wait for it.
             for (int i = 0; i < 30 && !run(adbExe, serial, 10, "get-state").trim().equals("device"); i++) Thread.sleep(2000);
+            // whpx_loop.sh scales the density down with a narrower screen (for 4K TVs); the
+            // cover screen keeps the device's density.
+            run(adbExe, serial, 10, "shell", "setprop whpx.fold 1");
             File tmp = new File(bridgeDir, "whpx_device_state_" + serial.replaceAll("[^A-Za-z0-9]", "_") + ".xml");
             Files.write(tmp.toPath(), stateXml().getBytes(StandardCharsets.UTF_8));
             run(adbExe, serial, 30, "push", tmp.getPath(), "/data/local/tmp/whpx_dsc.xml");
@@ -198,6 +282,11 @@ final class WhpxFold {
             String states = run(adbExe, serial, 10, "shell", "cmd device_state print-states 2>/dev/null | grep -c identifier=").trim();
             guestReady = parse(states, 0) >= 3;
             System.out.println("[WhpxFold] device states in guest: " + states + (guestReady ? "" : " (folding unavailable)"));
+            if (guestReady && coverCutoutSetup != null) {
+                // Fabricated disabled; the posture commands below enable them only when closed.
+                run(adbExe, serial, 30, "shell", coverCutoutSetup
+                    + "cmd overlay disable com.android.shell:WhpxCoverCutout >/dev/null 2>&1; cmd overlay disable com.android.shell:WhpxCoverCutoutRect >/dev/null 2>&1");
+            }
             String cmds = guestCommands();
             // Always, open too: Android keeps the "wm size" override across boots, so a device
             // shut down folded would otherwise start open with the cover screen's size.

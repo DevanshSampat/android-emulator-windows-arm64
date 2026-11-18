@@ -407,6 +407,17 @@ public class WhpxEmulatorBridge {
                     if (!ph.find()) continue;
                     int panel = Integer.parseInt(ph.group(1));
                     Matcher ov = override.matcher(out);
+                    // Foldables: Android rescales the density whenever the screen size or a
+                    // framework overlay changes; put the device's own back if that happened.
+                    int want = WhpxFold.expectedDensity();
+                    if (want > 0) {
+                        Process pd = new ProcessBuilder(sdkDir + "\\platform-tools\\adb.exe", "-s", emulatorSerial, "shell",
+                            "d=$(wm density | tail -1); [ \"$d\" = \"Override density: " + want + "\" ] || { wm density " + want + "; echo reset $d; }")
+                            .redirectErrorStream(true).start();
+                        String dout = new String(pd.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+                        pd.waitFor();
+                        if (dout.startsWith("reset")) System.out.println("[WhpxFold] density was " + dout.substring(6) + "; set " + want);
+                    }
                     boolean has = ov.find();
                     int w = has ? Integer.parseInt(ov.group(1)) : 0, h = has ? Integer.parseInt(ov.group(2)) : 0;
                     if (w != overrideW || h != overrideH) {
@@ -3073,6 +3084,8 @@ public class WhpxEmulatorBridge {
             ramMb = Math.max(2048, Math.min(8192, wantedRam));
             System.out.println("[WhpxEmulatorBridge] RAM: host " + hostRamMb + " MB, Device Manager " + rawRam + " MB -> guest " + ramMb + " MB");
             WhpxFold.configure(cfg, lcdDensity);
+            String foldSkin = cfg.get("skin.path");
+            WhpxFold.loadCoverCutout(foldSkin == null || foldSkin.isBlank() ? null : new File(foldSkin.trim()), lcdWidth);
 
 
 
