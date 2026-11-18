@@ -7884,7 +7884,10 @@ public class WhpxEmulatorBridge {
                         mouseLastX = x;
                         mouseLastY = y;
                         sendDirectInput("T 0 " + x + " " + y);
-                        WhpxDragSmoother.onDown(x, y, maxW, maxH, curRot);
+                        // Folded, Studio's coordinates span the cover screen, and Studio draws it at
+                        // another scale: the smoother must not reuse what it learned for the open panel.
+                        int[] foldArea = WhpxFold.overrideSize() != null ? overrideArea(curRot) : null;
+                        WhpxDragSmoother.onDown(x, y, foldArea != null ? foldArea[2] : maxW, foldArea != null ? foldArea[3] : maxH, curRot);
                     } else if (!WhpxDragSmoother.onMove(x, y) && (x != mouseLastX || y != mouseLastY)) {
                         mouseLastX = x;
                         mouseLastY = y;
