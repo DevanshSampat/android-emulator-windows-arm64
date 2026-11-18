@@ -2453,15 +2453,15 @@ public class WhpxEmulatorBridge {
 
 
 
-                "setprop persist.sys.timezone Asia/Kolkata; " +
+                // Through the time zone service, so the clock in the status bar is told. Setting
+                // persist.sys.timezone directly first made the service see no change: it kept GMT.
+                "cmd time_zone_detector suggest_manual_time_zone --zone_id " + hostTimeZone() + " || cmd alarm set-timezone " + hostTimeZone() + "; " +
 
 
 
-                "cmd time_zone_detector suggest_manual_time_zone --zone_id Asia/Kolkata; " +
 
 
 
-                "service call alarm 3 s16 Asia/Kolkata; " +
 
 
 
@@ -2804,7 +2804,7 @@ public class WhpxEmulatorBridge {
 
                     sendSerialSlow("sh -c \"echo '#!/system/bin/sh' > /dev/whpx_r && echo 'while true; do sleep 3600; done' >> /dev/whpx_r && chmod 755 /dev/whpx_r && mount -o bind /dev/whpx_r /vendor/bin/hw/android.hardware.radio-service.ranchu 2>/dev/null\"\r\n");
 
-                    sendSerialSlow("sh -c \"for i in 0 1 2 3 4 5; do touch /dev/hvc$i; chmod 666 /dev/hvc$i; done; setprop persist.sys.timezone Asia/Kolkata\"\r\n");
+                    sendSerialSlow("sh -c \"for i in 0 1 2 3 4 5; do touch /dev/hvc$i; chmod 666 /dev/hvc$i; done\"\r\n");
 
                     sendSerialSlow("sh -c \"(while [ ! -f /data/local/tmp/start_android_ui.sh ]; do sleep 1; done; sh /data/local/tmp/start_android_ui.sh) &\"\r\n");
 
@@ -3007,7 +3007,20 @@ public class WhpxEmulatorBridge {
 
             // The RAM set in Device Manager. Guests now have zram (compressed swap), so the
             // 3 GB floor that once covered for its absence would cost the host 1 GB for nothing.
-            ramMb = Math.max(2048, Math.min(8192, rawRam));
+            // A quarter of the host's RAM, or the RAM set in Device Manager if that is more; 2 to 8 GB.
+            // Studio creates most devices with 2 GB, which left Android 17 phones and foldables
+            // swapping to zram and janking. Wear keeps its own setting: a watch has no use for 4 GB.
+            boolean wearAvd = cfg.getOrDefault("tag.ids", cfg.getOrDefault("tag.id", "")).contains("android-wear");
+            long hostRamMb = 0;
+            try {
+                java.lang.management.OperatingSystemMXBean os = java.lang.management.ManagementFactory.getOperatingSystemMXBean();
+                if (os instanceof com.sun.management.OperatingSystemMXBean sun) hostRamMb = sun.getTotalMemorySize() >> 20;
+            } catch (Throwable ignored) {}
+            // Rounded to 256 MB: Windows reports a 16 GB PC as about 15.6 GB, which still gives 4 GB.
+            int quarter = (int) (Math.round(hostRamMb / 4.0 / 256.0) * 256);
+            int wantedRam = wearAvd ? rawRam : Math.max(rawRam, quarter);
+            ramMb = Math.max(2048, Math.min(8192, wantedRam));
+            System.out.println("[WhpxEmulatorBridge] RAM: host " + hostRamMb + " MB, Device Manager " + rawRam + " MB -> guest " + ramMb + " MB");
 
 
 
@@ -3135,6 +3148,20 @@ public class WhpxEmulatorBridge {
 
 
 
+    /** The PC's time zone as an IANA id for Android, e.g. Asia/Kolkata for India Standard Time. */
+    private static String hostTimeZone() {
+        String id;
+        try { id = java.time.ZoneId.systemDefault().normalized().getId(); } catch (Exception e) { return "Etc/UTC"; }
+        // Windows maps some zones to older names; Android knows them, but shows the current ones.
+        switch (id) {
+            case "Asia/Calcutta": return "Asia/Kolkata";
+            case "Asia/Katmandu": return "Asia/Kathmandu";
+            case "Asia/Saigon": return "Asia/Ho_Chi_Minh";
+            case "Asia/Rangoon": return "Asia/Yangon";
+            case "Z": case "UTC": case "GMT": return "Etc/UTC";
+            default: return id.matches("[A-Za-z_]+(/[A-Za-z0-9_+\\-]+)*") ? id : "Etc/UTC";
+        }
+    }
     private static int parseIntOrDefault(String s, int def) {
 
 
