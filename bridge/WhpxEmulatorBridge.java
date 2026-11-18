@@ -455,8 +455,11 @@ public class WhpxEmulatorBridge {
         if (WhpxFold.overrideSize() == null) return ImageFormat.getDefaultInstance();
         int[] a = overrideArea(rot);
         if (a == null) return ImageFormat.getDefaultInstance();
+        // Offsets 0, as Google's emulator sends them: the image is already just the cover screen,
+        // and Studio drops clicks outside this rectangle after making them relative to it, so a
+        // real offset lost every click on the left part of the screen.
         return ImageFormat.newBuilder().setFoldedDisplay(FoldedDisplay.newBuilder()
-            .setXOffset(a[0]).setYOffset(a[1]).setWidth(a[2]).setHeight(a[3]).build()).build();
+            .setXOffset(0).setYOffset(0).setWidth(a[2]).setHeight(a[3]).build()).build();
     }
 
     /**
