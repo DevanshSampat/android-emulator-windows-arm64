@@ -1980,6 +1980,13 @@ public class WhpxEmulatorBridge {
 
 
                             applyPostBootSettings(adbExe);
+                            if (WhpxFold.foldable()) {
+                                final String serialNow = emulatorSerial;
+                                Thread fold = new Thread(() -> WhpxFold.ensureGuest(adbExe, serialNow, bridgeDir,
+                                        EmulatorControllerServiceImpl::dispatchGuestInput), "WhpxFoldSetup");
+                                fold.setDaemon(true);
+                                fold.start();
+                            }
 
 
 
@@ -2137,6 +2144,7 @@ public class WhpxEmulatorBridge {
             adbOnline = false;
             currentRotation = 0;
             currentZAngle = 0f;
+            WhpxFold.onGuestRestart();
             cachedEncodedSeq = -1;
             System.out.println("[WhpxEmulatorBridge] Android restarted the device: starting QEMU again (boot " + (bootCount + 1) + ")");
             Thread.sleep(300);
@@ -3021,6 +3029,7 @@ public class WhpxEmulatorBridge {
             int wantedRam = wearAvd ? rawRam : Math.max(rawRam, quarter);
             ramMb = Math.max(2048, Math.min(8192, wantedRam));
             System.out.println("[WhpxEmulatorBridge] RAM: host " + hostRamMb + " MB, Device Manager " + rawRam + " MB -> guest " + ramMb + " MB");
+            WhpxFold.configure(cfg, lcdDensity);
 
 
 
@@ -4661,6 +4670,8 @@ public class WhpxEmulatorBridge {
 
 
 
+        // Foldables list their hinge and postures, so Studio offers Closed / Half-open / Open.
+        hwQemuContent = WhpxFold.patchIni(hwQemuContent);
         Files.write(hwQemuIni, hwQemuContent.getBytes(StandardCharsets.UTF_8));
 
 
@@ -6124,6 +6135,11 @@ public class WhpxEmulatorBridge {
 
 
                     .build());
+                if (WhpxFold.foldable()) {
+                    resp.onNext(Notification.newBuilder()
+                        .setPosture(Posture.newBuilder().setValueValue(WhpxFold.posture()).build()).build());
+                }
+                notificationObservers.add(resp);
 
 
 
@@ -8073,6 +8089,39 @@ public class WhpxEmulatorBridge {
 
 
         private static final java.util.List<StreamObserver<PhysicalModelValue>> physicalModelObservers = new java.util.concurrent.CopyOnWriteArrayList<>();
+        private static final java.util.List<StreamObserver<PhysicalModelValue>> hingeObservers = new java.util.concurrent.CopyOnWriteArrayList<>();
+        private static final java.util.List<StreamObserver<Notification>> notificationObservers = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+        private static PhysicalModelValue hingeValue() {
+            return PhysicalModelValue.newBuilder()
+                .setTarget(PhysicalModelValue.PhysicalType.HINGE_ANGLE0)
+                .setStatus(PhysicalModelValue.State.OK)
+                .setValue(ParameterValue.newBuilder().addData(WhpxFold.angle()).build())
+                .build();
+        }
+
+        /** Studio folded or unfolded the device: tell Android, then Studio's posture menu. */
+        private static void onHingeAngle(float angle) {
+            if (!WhpxFold.foldable()) return;
+            boolean changed = WhpxFold.setAngle(angle);
+            System.out.println("[WhpxFold] hinge angle " + angle + " -> posture " + WhpxFold.posture() + (changed ? "" : " (unchanged)"));
+            PhysicalModelValue v = hingeValue();
+            for (StreamObserver<PhysicalModelValue> obs : hingeObservers) {
+                try { obs.onNext(v); } catch (Throwable t) { hingeObservers.remove(obs); }
+            }
+            if (!changed) return;
+            String cmds = WhpxFold.guestCommands();
+            if (cmds != null) dispatchGuestInput(cmds);
+            notifyPosture();
+        }
+
+        static void notifyPosture() {
+            Notification n = Notification.newBuilder()
+                .setPosture(Posture.newBuilder().setValueValue(WhpxFold.posture()).build()).build();
+            for (StreamObserver<Notification> obs : notificationObservers) {
+                try { obs.onNext(n); } catch (Throwable t) { notificationObservers.remove(obs); }
+            }
+        }
 
 
 
@@ -8080,6 +8129,9 @@ public class WhpxEmulatorBridge {
 
         public void setPhysicalModel(PhysicalModelValue req, StreamObserver<Empty> resp) {
 
+            if (req != null && req.getTarget() == PhysicalModelValue.PhysicalType.HINGE_ANGLE0 && req.getValue().getDataCount() >= 1) {
+                onHingeAngle(req.getValue().getData(0));
+            }
             if (req != null && req.getTarget() == PhysicalModelValue.PhysicalType.ROTATION && req.getValue().getDataCount() >= 3) {
 
                 float z = req.getValue().getData(2);
@@ -8155,6 +8207,11 @@ public class WhpxEmulatorBridge {
         @Override
 
         public void getPhysicalModel(PhysicalModelValue req, StreamObserver<PhysicalModelValue> resp) {
+            if (req != null && req.getTarget() == PhysicalModelValue.PhysicalType.HINGE_ANGLE0) {
+                resp.onNext(hingeValue());
+                resp.onCompleted();
+                return;
+            }
 
             resp.onNext(PhysicalModelValue.newBuilder()
 
@@ -8175,6 +8232,13 @@ public class WhpxEmulatorBridge {
         @Override
 
         public void streamPhysicalModel(PhysicalModelValue req, StreamObserver<PhysicalModelValue> resp) {
+            if (req != null && req.getTarget() == PhysicalModelValue.PhysicalType.HINGE_ANGLE0) {
+                try {
+                    resp.onNext(hingeValue());
+                    hingeObservers.add(resp);
+                } catch (Throwable ignored) {}
+                return;
+            }
 
             try {
 
