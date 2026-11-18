@@ -321,6 +321,9 @@ public class WhpxEmulatorBridge {
         int maxW = req.getWidth() > 0 ? req.getWidth() : baseW;
         int maxH = req.getHeight() > 0 ? req.getHeight() : baseH;
         double scale = Math.min((double) maxW / baseW, (double) maxH / baseH);
+        // Folded, the viewer shows only the cover screen, so it needs more of the panel's pixels.
+        int[] fold = WhpxFold.overrideSize() != null ? overrideArea(curRot) : null;
+        if (fold != null) scale = Math.min((double) maxW / fold[2], (double) maxH / fold[3]);
         int w = 0, h = 0;
         if (scale < 0.75) {
             w = ((int) Math.ceil(lcdWidth * scale) + 1) & ~1;
@@ -5067,7 +5070,40 @@ public class WhpxEmulatorBridge {
         }
     }
 
+    /**
+     * The screen image for a client. A folded device shows only its cover screen: like Google's
+     * emulator, the image is just that part of the panel, and foldedDisplay says where it is.
+     * Studio scales the posture's device frame to the image, so a full-panel image stretched
+     * the closed frame across the inner screen's width.
+     */
     private static Image buildScreenImage(ImageFormat req, int seq) {
+        int rot = currentRotation;
+        int[] a = WhpxFold.overrideSize() != null ? overrideArea(rot) : null;
+        if (a == null) return buildFullImage(req, seq);
+        int pw = (rot % 2 == 0) ? lcdWidth : lcdHeight, ph = (rot % 2 == 0) ? lcdHeight : lcdWidth;
+        int maxW = req.getWidth() > 0 ? req.getWidth() : a[2], maxH = req.getHeight() > 0 ? req.getHeight() : a[3];
+        double s = Math.min(1.0, Math.min((double) maxW / a[2], (double) maxH / a[3]));
+        Image full = buildFullImage(req.toBuilder()
+            .setWidth((int) Math.ceil(pw * s)).setHeight((int) Math.ceil(ph * s)).build(), seq);
+        int fw = full.getWidth(), fh = full.getHeight();
+        if (fw <= 0 || fh <= 0) return full;
+        double k = (double) fw / pw;
+        int cx = Math.max(0, (int) Math.round(a[0] * k)), cy = Math.max(0, (int) Math.round(a[1] * k));
+        int cw = Math.max(2, Math.min(fw - cx, (int) Math.round(a[2] * k)) & ~1);
+        int ch = Math.max(2, Math.min(fh - cy, (int) Math.round(a[3] * k)) & ~1);
+        int bpp = full.getImage().size() / (fw * fh);
+        if (bpp < 3) return full;
+        byte[] src = full.getImage().toByteArray();
+        byte[] out = new byte[cw * ch * bpp];
+        for (int y = 0; y < ch; y++) {
+            System.arraycopy(src, ((cy + y) * fw + cx) * bpp, out, y * cw * bpp, cw * bpp);
+        }
+        ImageFormat f = full.getFormat().toBuilder().setWidth(cw).setHeight(ch).build();
+        return full.toBuilder().setFormat(f).setWidth(cw).setHeight(ch)
+            .setImage(com.android.tools.idea.protobuf.UnsafeByteOperations.unsafeWrap(out)).build();
+    }
+
+    private static Image buildFullImage(ImageFormat req, int seq) {
 
         if (frameMbb == null) initFrameMbb();
 

@@ -165,6 +165,8 @@ final class WhpxFold {
     static void ensureGuest(String adbExe, String serial, String bridgeDir, java.util.function.Consumer<String> shell) {
         if (!foldable || serial == null) return;
         try {
+            // adb can drop the device for a moment around boot (it reconnects): wait for it.
+            for (int i = 0; i < 30 && !run(adbExe, serial, 10, "get-state").trim().equals("device"); i++) Thread.sleep(2000);
             File tmp = new File(bridgeDir, "whpx_device_state_" + serial.replaceAll("[^A-Za-z0-9]", "_") + ".xml");
             Files.write(tmp.toPath(), stateXml().getBytes(StandardCharsets.UTF_8));
             run(adbExe, serial, 30, "push", tmp.getPath(), "/data/local/tmp/whpx_dsc.xml");
@@ -197,7 +199,9 @@ final class WhpxFold {
             guestReady = parse(states, 0) >= 3;
             System.out.println("[WhpxFold] device states in guest: " + states + (guestReady ? "" : " (folding unavailable)"));
             String cmds = guestCommands();
-            if (cmds != null && posture != OPENED) shell.accept(cmds);
+            // Always, open too: Android keeps the "wm size" override across boots, so a device
+            // shut down folded would otherwise start open with the cover screen's size.
+            if (cmds != null) shell.accept(cmds);
         } catch (Exception e) {
             System.out.println("[WhpxFold] setup failed: " + e);
         }

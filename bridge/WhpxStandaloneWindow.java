@@ -134,9 +134,11 @@ final class WhpxStandaloneWindow {
             if (f.hasFoldedDisplay() && f.getFoldedDisplay().getWidth() > 0) {
                 // Folded: only the cover screen is shown, and touches are relative to it.
                 com.android.emulator.control.FoldedDisplay fd = f.getFoldedDisplay();
+                // The bridge sends just the cover screen; crop only if the image is the whole panel.
+                boolean already = Math.abs((double) w / h - (double) fd.getWidth() / fd.getHeight()) < 0.02;
                 int pw = (rot % 2 == 0) ? host.displayWidth() : host.displayHeight();
                 double sx = (double) w / pw;
-                Rectangle crop = new Rectangle((int) Math.round(fd.getXOffset() * sx), (int) Math.round(fd.getYOffset() * sx),
+                Rectangle crop = already ? null : new Rectangle((int) Math.round(fd.getXOffset() * sx), (int) Math.round(fd.getYOffset() * sx),
                         (int) Math.round(fd.getWidth() * sx), (int) Math.round(fd.getHeight() * sx));
                 panel.show(dst, rot, crop, fd.getWidth(), fd.getHeight());
             } else {
