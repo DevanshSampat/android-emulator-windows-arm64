@@ -386,12 +386,13 @@ public class WhpxEmulatorBridge {
         return Files.isRegularFile(bundled) ? bundled.toString() : "python";
     }
 
-    private static volatile double touchScale = 1.0;
+    // The guest's "wm size" override, 0 when there is none (read every 5 s).
+    private static volatile int overrideW = 0, overrideH = 0;
 
     private static void startTouchScaleWatcher() {
         Thread t = new Thread(() -> {
             Pattern physical = Pattern.compile("Physical size: (\\d+)x");
-            Pattern override = Pattern.compile("Override size: (\\d+)x");
+            Pattern override = Pattern.compile("Override size: (\\d+)x(\\d+)");
             while (true) {
                 try {
                     Thread.sleep(5000);
@@ -403,11 +404,12 @@ public class WhpxEmulatorBridge {
                     if (!ph.find()) continue;
                     int panel = Integer.parseInt(ph.group(1));
                     Matcher ov = override.matcher(out);
-                    int ui = ov.find() ? Integer.parseInt(ov.group(1)) : panel;
-                    double scale = (ui > 0 && ui < panel) ? (double) ui / panel : 1.0;
-                    if (scale != touchScale) {
-                        touchScale = scale;
-                        System.out.println("[WhpxEmulatorBridge] Touch scale " + ui + "/" + panel);
+                    boolean has = ov.find();
+                    int w = has ? Integer.parseInt(ov.group(1)) : 0, h = has ? Integer.parseInt(ov.group(2)) : 0;
+                    if (w != overrideW || h != overrideH) {
+                        overrideW = w;
+                        overrideH = h;
+                        System.out.println("[WhpxEmulatorBridge] Guest screen " + (has ? w + "x" + h : "not overridden") + " on panel width " + panel);
                     }
                 } catch (InterruptedException e) {
                     return;
@@ -418,14 +420,49 @@ public class WhpxEmulatorBridge {
         t.start();
     }
 
+    /**
+     * Where the guest's screen is on the panel when "wm size" overrides it: scaled to fit and
+     * centred. Returns {x, y, width, height} in panel pixels for rotation rot, or null.
+     */
+    private static int[] overrideArea(int rot) {
+        int[] fold = WhpxFold.overrideSize();
+        int uw = fold != null ? fold[0] : overrideW, uh = fold != null ? fold[1] : overrideH;
+        if (uw <= 0 || uh <= 0) return null;
+        int pw = lcdWidth, ph = lcdHeight;
+        if (rot % 2 == 1) { int t = pw; pw = ph; ph = t; t = uw; uw = uh; uh = t; }
+        double s = Math.min((double) pw / uw, (double) ph / uh);
+        int cw = (int) Math.round(uw * s), ch = (int) Math.round(uh * s);
+        if (cw == pw && ch == ph && uw == pw) return null;
+        return new int[] { (pw - cw) / 2, (ph - ch) / 2, cw, ch, uw, uh };
+    }
+
+    /** A folded device shows only its cover screen: tell Studio where it is in the frame. */
+    private static ImageFormat foldFormat(int rot) {
+        if (WhpxFold.overrideSize() == null) return ImageFormat.getDefaultInstance();
+        int[] a = overrideArea(rot);
+        if (a == null) return ImageFormat.getDefaultInstance();
+        return ImageFormat.newBuilder().setFoldedDisplay(FoldedDisplay.newBuilder()
+            .setXOffset(a[0]).setYOffset(a[1]).setWidth(a[2]).setHeight(a[3]).build()).build();
+    }
+
+    /**
+     * Touches arrive in panel pixels; the guest takes them in its own (overridden) screen's pixels.
+     * The override may have another shape than the panel (a folded device's cover screen), so
+     * this removes the letterbox offset as well as scaling.
+     */
     private static String scaleTouch(String cmd) {
-        double scale = touchScale;
-        if (scale == 1.0 || !cmd.startsWith("T ")) return cmd;
+        if (!cmd.startsWith("T ")) return cmd;
+        int[] a = overrideArea(currentRotation);
+        if (a == null) return cmd;
         String[] f = cmd.split(" ");
         if (f.length != 4) return cmd;
         try {
-            return "T " + f[1] + " " + Math.round(Integer.parseInt(f[2]) * scale)
-                + " " + Math.round(Integer.parseInt(f[3]) * scale);
+            double s = (double) a[4] / a[2];
+            long x = Math.round((Integer.parseInt(f[2]) - a[0]) * s);
+            long y = Math.round((Integer.parseInt(f[3]) - a[1]) * s);
+            x = Math.max(0, Math.min(a[4] - 1, x));
+            y = Math.max(0, Math.min(a[5] - 1, y));
+            return "T " + f[1] + " " + x + " " + y;
         } catch (NumberFormatException e) {
             return cmd;
         }
@@ -5120,6 +5157,7 @@ public class WhpxEmulatorBridge {
                 .setDisplay(req.getDisplay())
 
                 .setRotation(protoRot)
+                .mergeFrom(foldFormat(curRot))
 
                 .build();
 
@@ -5612,6 +5650,7 @@ public class WhpxEmulatorBridge {
             .setDisplay(req.getDisplay())
 
             .setRotation(protoRot)
+            .mergeFrom(foldFormat(curRot))
 
             .build();
 

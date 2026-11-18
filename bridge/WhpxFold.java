@@ -127,6 +127,12 @@ final class WhpxFold {
         }
     }
 
+    /** The cover screen's size while closed (the guest's screen then has this size), else null. */
+    static int[] overrideSize() {
+        if (!foldable || !guestReady || posture != CLOSED || outerW <= 0 || outerH <= 0) return null;
+        return new int[] { outerW, outerH };
+    }
+
     /** A new QEMU run starts open: Android's device state does not survive the restart. */
     static void onGuestRestart() {
         guestReady = false;
