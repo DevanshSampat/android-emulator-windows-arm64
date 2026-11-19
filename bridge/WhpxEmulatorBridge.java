@@ -318,18 +318,16 @@ public class WhpxEmulatorBridge {
     private static void publishCaptureSize(ImageFormat req) {
         if (frameMbb == null || System.currentTimeMillis() < fullCaptureUntil) return;
         int curRot = currentRotation;
-        int baseW = (curRot % 2 == 0) ? lcdWidth : lcdHeight;
-        int baseH = (curRot % 2 == 0) ? lcdHeight : lcdWidth;
+        int[] d = displaySize();
+        int baseW = (curRot % 2 == 0) ? d[0] : d[1];
+        int baseH = (curRot % 2 == 0) ? d[1] : d[0];
         int maxW = req.getWidth() > 0 ? req.getWidth() : baseW;
         int maxH = req.getHeight() > 0 ? req.getHeight() : baseH;
         double scale = Math.min((double) maxW / baseW, (double) maxH / baseH);
-        // Folded, the viewer shows only the cover screen, so it needs more of the panel's pixels.
-        int[] fold = WhpxFold.overrideSize() != null ? overrideArea(curRot) : null;
-        if (fold != null) scale = Math.min((double) maxW / fold[2], (double) maxH / fold[3]);
         int w = 0, h = 0;
         if (scale < 0.75) {
-            w = ((int) Math.ceil(lcdWidth * scale) + 1) & ~1;
-            h = ((int) Math.ceil(lcdHeight * scale) + 1) & ~1;
+            w = ((int) Math.ceil(d[0] * scale) + 1) & ~1;
+            h = ((int) Math.ceil(d[1] * scale) + 1) & ~1;
         }
         // Studio can have several screenshot streams open at once (two views of the device at
         // slightly different sizes). Each used to write its own size every frame, so the
@@ -361,11 +359,11 @@ public class WhpxEmulatorBridge {
     // A screenshot must not be an upscaled copy of the stream, so ask for a full frame first.
     private static void holdFullCapture(ImageFormat req) {
         if (frameMbb == null) initFrameMbb();
-        if (frameMbb == null || frameMbb.getInt(4) >= lcdWidth) return;
+        if (frameMbb == null || frameMbb.getInt(4) >= displaySize()[0]) return;
         fullCaptureUntil = System.currentTimeMillis() + 500;
         writeCaptureSize(0, 0);
         try {
-            for (int i = 0; i < 40 && frameMbb.getInt(4) < lcdWidth; i++) Thread.sleep(5);
+            for (int i = 0; i < 40 && frameMbb.getInt(4) < displaySize()[0]; i++) Thread.sleep(5);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
@@ -442,7 +440,13 @@ public class WhpxEmulatorBridge {
      */
     private static int[] overrideArea(int rot) {
         int[] fold = WhpxFold.overrideSize();
-        int uw = fold != null ? fold[0] : overrideW, uh = fold != null ? fold[1] : overrideH;
+        if (fold != null) {
+            // Folded, the cover screen is the guest's other display and the image is all of it.
+            int uw = fold[0], uh = fold[1];
+            if (rot % 2 == 1) { int t = uw; uw = uh; uh = t; }
+            return new int[] { 0, 0, uw, uh, uw, uh };
+        }
+        int uw = overrideW, uh = overrideH;
         if (uw <= 0 || uh <= 0) return null;
         int pw = lcdWidth, ph = lcdHeight;
         if (rot % 2 == 1) { int t = pw; pw = ph; ph = t; t = uw; uw = uh; uh = t; }
@@ -454,7 +458,8 @@ public class WhpxEmulatorBridge {
 
     /** A folded device shows only its cover screen: tell Studio where it is in the frame. */
     private static ImageFormat foldFormat(int rot) {
-        if (WhpxFold.overrideSize() == null) return ImageFormat.getDefaultInstance();
+        // Only once the cover screen's frames arrive: Studio expects the image to be that screen.
+        if (WhpxFold.overrideSize() == null || coverFrameSize() == null) return ImageFormat.getDefaultInstance();
         int[] a = overrideArea(rot);
         if (a == null) return ImageFormat.getDefaultInstance();
         // Offsets 0, as Google's emulator sends them: the image is already just the cover screen,
@@ -493,6 +498,22 @@ public class WhpxEmulatorBridge {
 
 
     private static volatile MappedByteBuffer frameMbb = null;
+
+    /**
+     * The renderer marks frames of a foldable's cover screen (the guest's display 1) in the
+     * upper bits of the slot word. Returns that screen's size while its frames show, else null.
+     */
+    private static int[] coverFrameSize() {
+        MappedByteBuffer m = frameMbb;
+        if (m == null || (m.getInt(12) >>> 8) != 1) return null;
+        return WhpxFold.coverSize();
+    }
+
+    /** Size of the screen whose frames the renderer is sending. */
+    private static int[] displaySize() {
+        int[] c = coverFrameSize();
+        return c != null ? c : new int[] { lcdWidth, lcdHeight };
+    }
 
 
 
@@ -1213,6 +1234,8 @@ public class WhpxEmulatorBridge {
 
 
                 gpb.directory(Paths.get(bridgeDir).toFile());
+                int[] cover = WhpxFold.coverSize();
+                if (cover != null) gpb.environment().put("WHPX_COVER_SIZE", cover[0] + "x" + cover[1]);
                 gpb.environment().put("PATH", bridgeDir + ";" + sdkDir + "\\emulator\\lib64;" + System.getenv("PATH"));
                 gpb.redirectErrorStream(true);
 
@@ -3091,8 +3114,6 @@ public class WhpxEmulatorBridge {
             ramMb = Math.max(2048, Math.min(8192, wantedRam));
             System.out.println("[WhpxEmulatorBridge] RAM: host " + hostRamMb + " MB, Device Manager " + rawRam + " MB -> guest " + ramMb + " MB");
             WhpxFold.configure(cfg, lcdDensity);
-            String foldSkin = cfg.get("skin.path");
-            WhpxFold.loadCoverCutout(foldSkin == null || foldSkin.isBlank() ? null : new File(foldSkin.trim()), lcdWidth);
 
 
 
@@ -3998,6 +4019,7 @@ public class WhpxEmulatorBridge {
         // qemu.hw.mainkeys=0 on devices without hardware keys (whpx_init copies this over).
         // Without it large screens get neither a navigation bar nor the launcher's taskbar.
         if (!mainKeys) bc.append("androidboot.qemu.hw.mainkeys=\"0\"\n");
+        bc.append(WhpxFold.bootConfig(lcdDensity));
         if (!skinCutout.isEmpty()) bc.append("androidboot.whpx.cutout=\"").append(skinCutout).append("\"\n");
         if (!skinName.isEmpty()) bc.append("androidboot.whpx.skin=\"").append(skinName).append("\"\n");
         bc.append("androidboot.whpx.gfx_port=\"").append(gfxPort).append("\"\n");
@@ -5095,36 +5117,11 @@ public class WhpxEmulatorBridge {
     }
 
     /**
-     * The screen image for a client. A folded device shows only its cover screen: like Google's
-     * emulator, the image is just that part of the panel, and foldedDisplay says where it is.
-     * Studio scales the posture's device frame to the image, so a full-panel image stretched
-     * the closed frame across the inner screen's width.
+     * The screen image for a client. A folded foldable shows its cover screen, the guest's second
+     * display, as Google's emulator does: the image is that display and foldedDisplay says so.
      */
     private static Image buildScreenImage(ImageFormat req, int seq) {
-        int rot = currentRotation;
-        int[] a = WhpxFold.overrideSize() != null ? overrideArea(rot) : null;
-        if (a == null) return buildFullImage(req, seq);
-        int pw = (rot % 2 == 0) ? lcdWidth : lcdHeight, ph = (rot % 2 == 0) ? lcdHeight : lcdWidth;
-        int maxW = req.getWidth() > 0 ? req.getWidth() : a[2], maxH = req.getHeight() > 0 ? req.getHeight() : a[3];
-        double s = Math.min(1.0, Math.min((double) maxW / a[2], (double) maxH / a[3]));
-        Image full = buildFullImage(req.toBuilder()
-            .setWidth((int) Math.ceil(pw * s)).setHeight((int) Math.ceil(ph * s)).build(), seq);
-        int fw = full.getWidth(), fh = full.getHeight();
-        if (fw <= 0 || fh <= 0) return full;
-        double k = (double) fw / pw;
-        int cx = Math.max(0, (int) Math.round(a[0] * k)), cy = Math.max(0, (int) Math.round(a[1] * k));
-        int cw = Math.max(2, Math.min(fw - cx, (int) Math.round(a[2] * k)) & ~1);
-        int ch = Math.max(2, Math.min(fh - cy, (int) Math.round(a[3] * k)) & ~1);
-        int bpp = full.getImage().size() / (fw * fh);
-        if (bpp < 3) return full;
-        byte[] src = full.getImage().toByteArray();
-        byte[] out = new byte[cw * ch * bpp];
-        for (int y = 0; y < ch; y++) {
-            System.arraycopy(src, ((cy + y) * fw + cx) * bpp, out, y * cw * bpp, cw * bpp);
-        }
-        ImageFormat f = full.getFormat().toBuilder().setWidth(cw).setHeight(ch).build();
-        return full.toBuilder().setFormat(f).setWidth(cw).setHeight(ch)
-            .setImage(com.android.tools.idea.protobuf.UnsafeByteOperations.unsafeWrap(out)).build();
+        return buildFullImage(req, seq);
     }
 
     private static Image buildFullImage(ImageFormat req, int seq) {
@@ -5135,9 +5132,11 @@ public class WhpxEmulatorBridge {
 
         int curRot = currentRotation;
 
-        int baseW = (curRot % 2 == 0) ? lcdWidth : lcdHeight;
+        int[] disp = displaySize();
 
-        int baseH = (curRot % 2 == 0) ? lcdHeight : lcdWidth;
+        int baseW = (curRot % 2 == 0) ? disp[0] : disp[1];
+
+        int baseH = (curRot % 2 == 0) ? disp[1] : disp[0];
 
 
 
@@ -5199,7 +5198,7 @@ public class WhpxEmulatorBridge {
 
         int fh = (frameMbb != null) ? frameMbb.getInt(8) : 0;
 
-        int activeSlot = (frameMbb != null) ? frameMbb.getInt(12) : 0;
+        int activeSlot = (frameMbb != null) ? (frameMbb.getInt(12) & 0xFF) : 0;
 
         int slotOffset = 16 + (activeSlot == 1 ? (lcdWidth * lcdHeight * 4) : 0);
 
@@ -5252,7 +5251,7 @@ public class WhpxEmulatorBridge {
 
 
 
-        if (curSeq > 0 && fw > 0 && fh > 0 && fw <= lcdWidth && fh <= lcdHeight) {
+        if (curSeq > 0 && fw > 0 && fh > 0 && (long) fw * fh <= (long) lcdWidth * lcdHeight) {
 
 
 
@@ -5260,7 +5259,7 @@ public class WhpxEmulatorBridge {
 
 
 
-                if (curRot == 0 && w == fw && h == fh && fw == lcdWidth && fmt == ImageFormat.ImgFormat.RGBA8888) {
+                if (curRot == 0 && w == fw && h == fh && fw == disp[0] && fmt == ImageFormat.ImgFormat.RGBA8888) {
 
                     ByteBuffer slice = frameMbb.duplicate();
 
@@ -5278,7 +5277,7 @@ public class WhpxEmulatorBridge {
 
                     bs = com.android.tools.idea.protobuf.UnsafeByteOperations.unsafeWrap(rgba); // fresh array, not reused
 
-                } else if (curRot == 0 && w == fw && h == fh && fw == lcdWidth && fmt == ImageFormat.ImgFormat.RGB888) {
+                } else if (curRot == 0 && w == fw && h == fh && fw == disp[0] && fmt == ImageFormat.ImgFormat.RGB888) {
 
                     ByteBuffer slice = frameMbb.duplicate();
 

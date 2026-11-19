@@ -556,6 +556,12 @@ class GfxstreamPipeServer {
     static int frameDirtyCounter = 0;
     static int lcdWidth = 1280;
     static int lcdHeight = 2856;
+    // A foldable's cover screen, the guest's second display (WHPX_COVER_SIZE=WxH from the
+    // bridge). Folded, only it composes; its frames go out at its own size, marked display 1.
+    static int coverW = 0, coverH = 0;
+    static bool IsDisplaySize(int w, int h) {
+        return (w == lcdWidth && h == lcdHeight) || (coverW > 0 && w == coverW && h == coverH);
+    }
     static string frameOutputPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "whpx_frame.dat");
     static FileStream sFrameFs = null;
     static MemoryMappedFile sFrameMmf = null;
@@ -624,11 +630,11 @@ class GfxstreamPipeServer {
 
     // rcComposeWithoutPost: one full-screen layer scaled into target. It is never shown.
     // The renderer keeps the viewport at display size, so the layer rectangle is in target pixels.
-    static void WriteScaleCompose(IntPtr buf, int src, int target, int w, int h) {
+    static void WriteScaleCompose(IntPtr buf, int src, int target, int w, int h, int srcW, int srcH) {
         int[] v = { 10060, 88, 72, 72, 2, 0, target, 1,
                     src, 2 /* DEVICE */, 0, 0, w, h };
         for (int i = 0; i < v.Length; i++) Marshal.WriteInt32(buf, i * 4, v[i]);
-        float[] crop = { 0, 0, lcdWidth, lcdHeight };
+        float[] crop = { 0, 0, srcW, srcH };
         for (int i = 0; i < 4; i++) Marshal.WriteInt32(buf, 56 + i * 4, BitConverter.ToInt32(BitConverter.GetBytes(crop[i]), 0));
         Marshal.WriteInt32(buf, 72, 1); // HWC2_BLEND_MODE_NONE
         Marshal.WriteInt32(buf, 76, BitConverter.ToInt32(BitConverter.GetBytes(1f), 0)); // alpha
@@ -905,7 +911,7 @@ class GfxstreamPipeServer {
             int currentSlot = 0;
             int scaleCb = 0, scaleW = 0, scaleH = 0;
             int lastReqW = -1, lastReqH = -1;
-            int lastPubW = 0, lastPubH = 0, sameRetries = 0;
+            int lastPubW = 0, lastPubH = 0, sameRetries = 0, lastPubDisplay = 0;
             byte[] outBytes = new byte[8 + lcdWidth * lcdHeight * 4];
             byte[] rowTemp = new byte[lcdWidth * 4];
 
@@ -931,12 +937,15 @@ class GfxstreamPipeServer {
                     w = dims[0];
                     h = dims[1];
                 }
-                if (w != lcdWidth || h != lcdHeight) {
+                if (!IsDisplaySize(w, h)) {
                     if (CapDiag.TryAdd("dims" + targetCb, true)) Console.WriteLine("[Capture] skip cb=" + targetCb + " recorded " + w + "x" + h + " != lcd " + lcdWidth + "x" + lcdHeight);
                     Thread.Sleep(2);
                     continue;
                 }
-                int pixBytes = w * h * 4;
+                int srcW = w, srcH = h;
+                int display = (w == lcdWidth && h == lcdHeight) ? 0 : 1;
+                // Slots stay inner-screen sized: the bridge finds slot 1 at that offset.
+                int pixBytes = lcdWidth * lcdHeight * 4;
                 int writeSlot = 1 - currentSlot;
                 int slotOffset = 16 + writeSlot * pixBytes;
                 if (wantScaled) {
@@ -953,7 +962,7 @@ class GfxstreamPipeServer {
                     h = scaleH;
                 }
 
-                if (outBytes.Length != 8 + pixBytes) outBytes = new byte[8 + pixBytes];
+                if (outBytes.Length != 8 + w * h * 4) outBytes = new byte[8 + w * h * 4];
                 Buffer.BlockCopy(BitConverter.GetBytes(w), 0, outBytes, 0, 4);
                 Buffer.BlockCopy(BitConverter.GetBytes(h), 0, outBytes, 4, 4);
 
@@ -970,7 +979,7 @@ class GfxstreamPipeServer {
 
                     int pre = 0;
                     if (wantScaled) {
-                        WriteScaleCompose(buf, targetCb, scaleCb, scaleW, scaleH);
+                        WriteScaleCompose(buf, targetCb, scaleCb, scaleW, scaleH, srcW, srcH);
                         pre = 88;
                     }
                     Marshal.WriteInt32(buf, pre + 0, 10023); // OP_rcReadColorBuffer
@@ -1034,7 +1043,7 @@ class GfxstreamPipeServer {
                     bool same = false;
                     unsafe {
                         // The previous frame is in the other slot of the frame file.
-                        if (sFramePtr != null && w == lastPubW && h == lastPubH) {
+                        if (sFramePtr != null && w == lastPubW && h == lastPubH && display == lastPubDisplay) {
                             same = memcmp((IntPtr)(sFramePtr + slotOffset), (IntPtr)(sFramePtr + 16 + currentSlot * pixBytes), (UIntPtr)(uint)(w * h * 4)) == 0;
                         }
                     }
@@ -1051,6 +1060,7 @@ class GfxstreamPipeServer {
                     sameRetries = 0;
                     lastPubW = w;
                     lastPubH = h;
+                    lastPubDisplay = display;
                 }
 
                 if (ok) {
@@ -1059,7 +1069,7 @@ class GfxstreamPipeServer {
                             int nextSeq = Interlocked.Increment(ref sFrameSeq);
                             *(int*)(sFramePtr + 4) = w;
                             *(int*)(sFramePtr + 8) = h;
-                            *(int*)(sFramePtr + 12) = writeSlot;
+                            *(int*)(sFramePtr + 12) = writeSlot | (display << 8);
                             Thread.MemoryBarrier();
                             *(int*)(sFramePtr + 0) = nextSeq;
                             currentSlot = writeSlot;
@@ -1286,7 +1296,7 @@ class GfxstreamPipeServer {
                     int cb = BitConverter.ToInt32(buf, off + 8);
                     int[] cd;
                     { int[] dd; string ds = cbDims.TryGetValue(cb, out dd) ? dd[0] + "x" + dd[1] : "unknown"; if (CapDiag.TryAdd("post" + cb, true)) Console.WriteLine("[Capture] FBPost cb=" + cb + " dims=" + ds); }
-                    if (!cbDims.TryGetValue(cb, out cd) || (cd[0] == lcdWidth && cd[1] == lcdHeight)) {
+                    if (!cbDims.TryGetValue(cb, out cd) || IsDisplaySize(cd[0], cd[1])) {
                         hasSeenRealDisplayPost = true;
                         KeepColorBufferAlive(cb, cbPinned.TryAdd(cb, true) ? 2 : 0);
                         bool composerActive = (masterComposeCb > 0) && (unchecked(Environment.TickCount - lastComposeTick) < 1500);
@@ -1317,7 +1327,7 @@ class GfxstreamPipeServer {
                 if (pktLen == 16) {
                     int cb = BitConverter.ToInt32(buf, off + 12);
                     int[] cd;
-                    if (!cbDims.TryGetValue(cb, out cd) || (cd[0] == lcdWidth && cd[1] == lcdHeight)) {
+                    if (!cbDims.TryGetValue(cb, out cd) || IsDisplaySize(cd[0], cd[1])) {
                         hasSeenRealDisplayPost = true;
                         KeepColorBufferAlive(cb, cbPinned.TryAdd(cb, true) ? 2 : 0);
                         masterComposeCb = cb;
@@ -1338,7 +1348,7 @@ class GfxstreamPipeServer {
                     int targetCb = (pktLen >= targetOff + 4) ? BitConverter.ToInt32(buf, off + targetOff) : 0;
                     int[] cd;
                     if (targetCb > 0) {
-                        if (cbDims.TryGetValue(targetCb, out cd) && cd[0] == lcdWidth && cd[1] == lcdHeight) {
+                        if (cbDims.TryGetValue(targetCb, out cd) && IsDisplaySize(cd[0], cd[1])) {
                             KeepColorBufferAlive(targetCb, cbPinned.TryAdd(targetCb, true) ? 2 : 0);
                             masterComposeCb = targetCb;
                             lastComposeTick = Environment.TickCount;
@@ -1687,6 +1697,14 @@ class GfxstreamPipeServer {
         if (args.Length >= 2) {
             int.TryParse(args[0], out lcdWidth);
             int.TryParse(args[1], out lcdHeight);
+        }
+        string cover = Environment.GetEnvironmentVariable("WHPX_COVER_SIZE");
+        if (!string.IsNullOrEmpty(cover)) {
+            string[] cs = cover.Split('x');
+            if (cs.Length == 2 && int.TryParse(cs[0], out coverW) && int.TryParse(cs[1], out coverH)
+                && (long)coverW * coverH <= (long)lcdWidth * lcdHeight) {
+                Console.WriteLine("[GfxstreamPipeServer] cover screen " + coverW + "x" + coverH + " as display 1");
+            } else { coverW = coverH = 0; }
         }
         int port = 5000;
         if (args.Length >= 3) int.TryParse(args[2], out port);
