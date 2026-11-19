@@ -162,8 +162,8 @@ while true; do
       settings put global transition_animation_scale 1.0 2>/dev/null
       settings put global animator_duration_scale 1.0 2>/dev/null
       settings put global disable_hw_overlays 1 2>/dev/null
-      # Blurs cost about 2.5 ms of composition per frame; on only with WHPX_BLUR=1 on the host.
-      if [ "$(getprop ro.boot.whpx.blur)" = 1 ]; then settings put global disable_window_blurs 0 2>/dev/null; else settings put global disable_window_blurs 1 2>/dev/null; fi
+      # Blurs as on a real device (about 2.5 ms more composition per frame); WHPX_BLUR=0 on the host turns them off.
+      if [ "$(getprop ro.boot.whpx.blur)" = 0 ]; then settings put global disable_window_blurs 1 2>/dev/null; else settings put global disable_window_blurs 0 2>/dev/null; fi
       touch /dev/whpx_scales_done 2>/dev/null
     fi
   fi
