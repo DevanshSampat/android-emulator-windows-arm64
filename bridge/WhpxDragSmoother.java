@@ -84,6 +84,34 @@ final class WhpxDragSmoother {
     private static long lastStudioNs;
     private static Thread poller;
 
+    private static MethodHandle getAsyncKeyState;
+    private static boolean keyStateTried;
+
+    /**
+     * Whether Ctrl is down on the host. A touchpad pinch reaches Studio as Ctrl + mouse wheel
+     * (Windows holds Ctrl for it), and Studio forwards only the wheel, so the bridge asks here.
+     */
+    static synchronized boolean ctrlDown() {
+        if (!keyStateTried) {
+            keyStateTried = true;
+            try {
+                if (System.getProperty("os.name", "").startsWith("Windows")) {
+                    SymbolLookup user32 = SymbolLookup.libraryLookup("user32", Arena.global());
+                    getAsyncKeyState = Linker.nativeLinker().downcallHandle(user32.find("GetAsyncKeyState").orElseThrow(),
+                            FunctionDescriptor.of(java.lang.foreign.ValueLayout.JAVA_SHORT, JAVA_INT));
+                }
+            } catch (Throwable t) {
+                System.out.println("[DragSmoother] no key state: " + t);
+            }
+        }
+        if (getAsyncKeyState == null) return false;
+        try {
+            return ((short) getAsyncKeyState.invokeExact(0x11 /* VK_CONTROL */) & 0x8000) != 0;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     private static long cursor() {
         try {
             int ok = (int) getCursorPos.invokeExact(point);

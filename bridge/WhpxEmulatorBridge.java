@@ -8034,6 +8034,60 @@ public class WhpxEmulatorBridge {
         private static volatile int pointerX = -1;
         private static volatile int pointerY = -1;
 
+        // A touchpad pinch (Ctrl + wheel on Windows) played to the guest as two fingers.
+        private static final Object pinchLock = new Object();
+        private static boolean pinching = false;
+        private static int pinchCx, pinchCy;
+        private static double pinchD;
+        private static long pinchLastMs;
+        private static Thread pinchEnder;
+
+        private static void sendPinch() {
+            int a = (int) Math.round(pinchD);
+            String[] f0 = scaleTouch("T 0 " + Math.max(0, pinchCx - a) + " " + pinchCy).split(" ");
+            String[] f1 = scaleTouch("T 0 " + (pinchCx + a) + " " + pinchCy).split(" ");
+            sendDirectInput("M 2 0 " + f0[2] + " " + f0[3] + " 1 " + f1[2] + " " + f1[3]);
+        }
+
+        /**
+         * Wheel up (away, zoom in) spreads the fingers, wheel down pinches them; they lift when the
+         * wheel stops for 200 ms or Ctrl is released.
+         */
+        private static void pinchWheel(int dy) {
+            int curRot = currentRotation;
+            int[] fold = WhpxFold.overrideSize();
+            int w = fold != null ? fold[0] : lcdWidth, h = fold != null ? fold[1] : lcdHeight;
+            if (curRot % 2 == 1) { int t = w; w = h; h = t; }
+            synchronized (pinchLock) {
+                if (!pinching) {
+                    pinchCx = Math.max(1, Math.min(w - 2, pointerX >= 0 ? pointerX : w / 2));
+                    pinchCy = Math.max(0, Math.min(h - 1, pointerY >= 0 ? pointerY : h / 2));
+                    pinchD = Math.min(w, h) / 8.0;
+                    pinching = true;
+                    sendPinch();
+                    if (pinchEnder == null) {
+                        pinchEnder = new Thread(() -> {
+                            while (true) {
+                                try { Thread.sleep(20); } catch (InterruptedException e) { return; }
+                                synchronized (pinchLock) {
+                                    if (pinching && (System.currentTimeMillis() - pinchLastMs > 200 || !WhpxDragSmoother.ctrlDown())) {
+                                        pinching = false;
+                                        sendDirectInput("M 0");
+                                    }
+                                }
+                            }
+                        }, "whpx-pinch");
+                        pinchEnder.setDaemon(true);
+                        pinchEnder.start();
+                    }
+                }
+                double max = Math.min(pinchCx, w - 1 - pinchCx);
+                pinchD = Math.max(20, Math.min(Math.max(20, max), pinchD * Math.exp(dy / 600.0)));
+                pinchLastMs = System.currentTimeMillis();
+                sendPinch();
+            }
+        }
+
         private static void handleWheelEvent(WheelEvent req) {
 
 
@@ -8045,6 +8099,10 @@ public class WhpxEmulatorBridge {
             int dx = req.getDx();
             int dy = req.getDy();
             if (dx == 0 && dy == 0) return;
+            if (dy != 0 && !mtActive && !touchDown && !mouseDown && WhpxDragSmoother.ctrlDown()) {
+                pinchWheel(dy);
+                return;
+            }
             // Studio scales 120 to one wheel notch; touchpads send fractions of that.
             // Android's AXIS_VSCROLL is positive for wheel-away (scroll up) like dy, and
             // AXIS_HSCROLL is positive for scrolling right, which is the opposite of dx.
