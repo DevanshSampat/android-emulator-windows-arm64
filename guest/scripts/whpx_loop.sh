@@ -162,7 +162,7 @@ while true; do
       settings put global transition_animation_scale 1.0 2>/dev/null
       settings put global animator_duration_scale 1.0 2>/dev/null
       settings put global disable_hw_overlays 1 2>/dev/null
-      settings put global disable_window_blurs 1 2>/dev/null
+      settings put global disable_window_blurs 0 2>/dev/null
       touch /dev/whpx_scales_done 2>/dev/null
     fi
   fi

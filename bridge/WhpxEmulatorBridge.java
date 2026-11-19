@@ -2554,7 +2554,7 @@ public class WhpxEmulatorBridge {
 
 
 
-                "settings put global disable_window_blurs 1; " +
+                "settings put global disable_window_blurs 0; " +
 
 
 
