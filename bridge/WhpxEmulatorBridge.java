@@ -7495,7 +7495,48 @@ public class WhpxEmulatorBridge {
             }
         }
 
+        // Fingers down in a multi-touch gesture (Studio's pinch, Ctrl+drag): id -> guest position.
+        private static final java.util.TreeMap<Integer, int[]> mtPoints = new java.util.TreeMap<>();
+        private static boolean mtActive = false;
+
+        /**
+         * Two or more touches (Studio's pinch draws two dots): the guest gets every finger, with
+         * the pointer-down and pointer-up events gestures need, through the daemon's "M" command.
+         */
+        private static void handleMultiTouch(TouchEvent req) {
+            if (touchDown) {
+                touchDown = false;
+                sendDirectInput("T 1 " + touchLastX + " " + touchLastY);
+            }
+            int curRot = currentRotation;
+            int maxW = (curRot % 2 == 0) ? lcdWidth : lcdHeight;
+            int maxH = (curRot % 2 == 0) ? lcdHeight : lcdWidth;
+            if (req.getTouchesCount() == 0) mtPoints.clear();
+            for (Touch t : req.getTouchesList()) {
+                if (t.getPressure() == 0) {
+                    mtPoints.remove(t.getIdentifier());
+                    continue;
+                }
+                int[] cur = toCurrentOrientation(t.getX(), t.getY(), curRot);
+                int x = Math.max(0, Math.min(maxW - 1, cur[0]));
+                int y = Math.max(0, Math.min(maxH - 1, cur[1]));
+                // Same scaling as single touches (the folded cover screen, a "wm size" override).
+                String[] f = scaleTouch("T 0 " + x + " " + y).split(" ");
+                mtPoints.put(t.getIdentifier(), new int[] { Integer.parseInt(f[2]), Integer.parseInt(f[3]) });
+            }
+            StringBuilder cmd = new StringBuilder("M ").append(mtPoints.size());
+            for (java.util.Map.Entry<Integer, int[]> e : mtPoints.entrySet()) {
+                cmd.append(' ').append(e.getKey()).append(' ').append(e.getValue()[0]).append(' ').append(e.getValue()[1]);
+            }
+            sendDirectInput(cmd.toString());
+            mtActive = !mtPoints.isEmpty();
+        }
+
         private static void handleTouchEvent(TouchEvent req) {
+            if (req != null && (req.getTouchesCount() >= 2 || mtActive)) {
+                handleMultiTouch(req);
+                return;
+            }
 
 
 
