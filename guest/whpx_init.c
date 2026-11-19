@@ -274,6 +274,43 @@ static void apply_boot_density(void) {
     run_cmd("/system/bin/sh", args);
 }
 
+/* androidboot.qemu.hw.mainkeys: the emulator sets qemu.hw.mainkeys=0 for devices without
+ * hardware keys, and the images rely on it (config_showNavigationBar is false). The window
+ * manager reads it once as system_server starts; without it large screens get neither a
+ * navigation bar nor the launcher's taskbar. Read straight from /proc/bootconfig and set
+ * with setprop directly, as for the adb properties. */
+static void apply_boot_mainkeys(void) {
+    char buf[16384];
+    int fd = open("/proc/bootconfig", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    int n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return;
+    buf[n] = 0;
+    const char* key = "androidboot.qemu.hw.mainkeys = \"";
+    char* p = strstr(buf, key);
+    if (!p) return;
+    p += strlen(key);
+    char val[4] = { 0 };
+    if (p[0] != '0' && p[0] != '1') return;
+    val[0] = p[0];
+    /* Android programs can't start until apexd has mounted the runtime APEX (the dynamic
+     * linker); exec fails with 127 until then. That is still well before system_server, so
+     * retry in a child without holding up the supervisor. */
+    if (fork() != 0) return;
+    char* a[] = { "/system/bin/setprop", "qemu.hw.mainkeys", val, NULL };
+    int rc = -1, tries = 0;
+    for (; tries < 600; tries++) {
+        rc = run_cmd_status("/system/bin/setprop", a);
+        if (rc != 127 && rc != -1) break;
+        usleep(50000);
+    }
+    char msg[80];
+    snprintf(msg, sizeof(msg), "qemu.hw.mainkeys=%s (setprop rc %d after %d tries)", val, rc, tries + 1);
+    klog(msg);
+    _exit(0);
+}
+
 /* Returns 1 if any process named "adbd" is running (scans /proc/<pid>/comm). */
 static char g_android_env_buf[32768];
 static char* g_android_env[160];
@@ -1148,6 +1185,7 @@ static void run_supervisor(void) {
     }
 
     apply_boot_density();
+    apply_boot_mainkeys();
 
     // Configure system properties via /system/bin/setprop directly
     if (access("/system/bin/setprop", X_OK) == 0) {

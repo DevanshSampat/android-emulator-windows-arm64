@@ -238,6 +238,8 @@ public class WhpxEmulatorBridge {
 
 
     private static int lcdWidth = 1080;
+    /** The AVD's hw.mainKeys. Without hardware keys Android draws a navigation bar or taskbar. */
+    private static boolean mainKeys = false;
 
 
 
@@ -3041,6 +3043,8 @@ public class WhpxEmulatorBridge {
 
             isPixel7 = (sysDir != null && sysDir.contains("android-33")) || (avdId != null && avdId.toLowerCase().contains("pixel_7"));
         lcdWidth = parseIntOrDefault(cfg.get("hw.lcd.width"), 1080);
+        String keys = cfg.getOrDefault("hw.mainKeys", "no").trim();
+        mainKeys = keys.equalsIgnoreCase("yes") || keys.equalsIgnoreCase("true");
 
 
 
@@ -3990,6 +3994,10 @@ public class WhpxEmulatorBridge {
 
 
         bc.append("androidboot.lcd_density=\"").append(lcdDensity).append("\"\n");
+        // The images ship config_showNavigationBar false and rely on the emulator setting
+        // qemu.hw.mainkeys=0 on devices without hardware keys (whpx_init copies this over).
+        // Without it large screens get neither a navigation bar nor the launcher's taskbar.
+        if (!mainKeys) bc.append("androidboot.qemu.hw.mainkeys=\"0\"\n");
         if (!skinCutout.isEmpty()) bc.append("androidboot.whpx.cutout=\"").append(skinCutout).append("\"\n");
         if (!skinName.isEmpty()) bc.append("androidboot.whpx.skin=\"").append(skinName).append("\"\n");
         bc.append("androidboot.whpx.gfx_port=\"").append(gfxPort).append("\"\n");
