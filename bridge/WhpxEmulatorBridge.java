@@ -472,9 +472,11 @@ public class WhpxEmulatorBridge {
     /** A folded device shows only its cover screen: tell Studio where it is in the frame. */
     private static ImageFormat foldFormat(int rot) {
         // Only once the cover screen's frames arrive: Studio expects the image to be that screen.
-        if (WhpxFold.overrideSize() == null || coverFrameSize() == null) return ImageFormat.getDefaultInstance();
-        int[] a = overrideArea(rot);
-        if (a == null) return ImageFormat.getDefaultInstance();
+        int[] a = WhpxFold.overrideSize();
+        if (a == null || coverFrameSize() == null) return ImageFormat.getDefaultInstance();
+        // In the display's natural orientation, like Studio's touch positions: Studio turns it
+        // by the image's rotation itself.
+        a = new int[] { 0, 0, a[0], a[1] };
         // Offsets 0, as Google's emulator sends them: the image is already just the cover screen,
         // and Studio drops clicks outside this rectangle after making them relative to it, so a
         // real offset lost every click on the left part of the screen.
