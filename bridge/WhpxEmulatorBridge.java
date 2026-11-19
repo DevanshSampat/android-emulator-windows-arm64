@@ -7476,6 +7476,23 @@ public class WhpxEmulatorBridge {
 
 
 
+        /**
+         * Studio sends positions in the display's natural (portrait) orientation: it turns the
+         * point back by the image's rotation (its "orientation quadrants"), as Google's emulator
+         * expects. The guest takes them in its current orientation, so turn them forward again.
+         * Folded, they are relative to the cover screen.
+         */
+        static int[] toCurrentOrientation(int x, int y, int rot) {
+            int[] fold = WhpxFold.overrideSize();
+            int w = fold != null ? fold[0] : lcdWidth, h = fold != null ? fold[1] : lcdHeight;
+            switch (rot & 3) {
+                case 1: return new int[] { y, w - x };
+                case 2: return new int[] { w - x, h - y };
+                case 3: return new int[] { h - y, x };
+                default: return new int[] { x, y };
+            }
+        }
+
         private static void handleTouchEvent(TouchEvent req) {
 
 
@@ -7592,9 +7609,10 @@ public class WhpxEmulatorBridge {
 
             Touch t = req.getTouches(0);
 
-            int px = Math.max(0, Math.min(maxW - 1, t.getX()));
+            int[] cur = toCurrentOrientation(t.getX(), t.getY(), curRot);
+            int px = Math.max(0, Math.min(maxW - 1, cur[0]));
 
-            int py = Math.max(0, Math.min(maxH - 1, t.getY()));
+            int py = Math.max(0, Math.min(maxH - 1, cur[1]));
 
             int x = px;
 
@@ -7872,9 +7890,10 @@ public class WhpxEmulatorBridge {
 
             int maxH = (curRot % 2 == 0) ? lcdHeight : lcdWidth;
 
-            int px = Math.max(0, Math.min(maxW - 1, req.getX()));
+            int[] cur = toCurrentOrientation(req.getX(), req.getY(), curRot);
+            int px = Math.max(0, Math.min(maxW - 1, cur[0]));
 
-            int py = Math.max(0, Math.min(maxH - 1, req.getY()));
+            int py = Math.max(0, Math.min(maxH - 1, cur[1]));
 
             int x = px;
 
