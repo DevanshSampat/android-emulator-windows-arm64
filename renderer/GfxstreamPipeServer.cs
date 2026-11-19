@@ -559,6 +559,8 @@ class GfxstreamPipeServer {
     // A foldable's cover screen, the guest's second display (WHPX_COVER_SIZE=WxH from the
     // bridge). Folded, only it composes; its frames go out at its own size, marked display 1.
     static int coverW = 0, coverH = 0;
+    static readonly bool capLog = Environment.GetEnvironmentVariable("WHPX_CAPLOG") == "1";
+    static void CapLog(string m) { if (capLog) Console.WriteLine("[CAPLOG] " + Environment.TickCount + " " + m); }
     static bool IsDisplaySize(int w, int h) {
         return (w == lcdWidth && h == lcdHeight) || (coverW > 0 && w == coverW && h == coverH);
     }
@@ -1301,6 +1303,7 @@ class GfxstreamPipeServer {
                         KeepColorBufferAlive(cb, cbPinned.TryAdd(cb, true) ? 2 : 0);
                         bool composerActive = (masterComposeCb > 0) && (unchecked(Environment.TickCount - lastComposeTick) < 1500);
                         if (!composerActive || cb == masterComposeCb) {
+                            CapLog("FBPost cb=" + cb);
                             activeDisplayCb = cb;
                             lastDisplayPostTick = Environment.TickCount;
                             lastPostTick = Environment.TickCount;
@@ -1328,6 +1331,7 @@ class GfxstreamPipeServer {
                     int cb = BitConverter.ToInt32(buf, off + 12);
                     int[] cd;
                     if (!cbDims.TryGetValue(cb, out cd) || IsDisplaySize(cd[0], cd[1])) {
+                        CapLog("SetDisplayCB disp=" + BitConverter.ToInt32(buf, off + 8) + " cb=" + cb + " known=" + (cd != null));
                         hasSeenRealDisplayPost = true;
                         KeepColorBufferAlive(cb, cbPinned.TryAdd(cb, true) ? 2 : 0);
                         masterComposeCb = cb;
@@ -1348,6 +1352,7 @@ class GfxstreamPipeServer {
                     int targetCb = (pktLen >= targetOff + 4) ? BitConverter.ToInt32(buf, off + targetOff) : 0;
                     int[] cd;
                     if (targetCb > 0) {
+                        if (capLog) CapLog("Compose op=" + op + " v=" + ver + " disp=" + (ver >= 2 ? BitConverter.ToInt32(buf, off + 20) : 0) + " target=" + targetCb + " dims=" + (cbDims.TryGetValue(targetCb, out cd) ? cd[0] + "x" + cd[1] : "?") + " layers=" + (pktLen >= targetOff + 8 ? BitConverter.ToInt32(buf, off + targetOff + 4) : -1) + " l0cb=" + (pktLen >= targetOff + 12 ? BitConverter.ToInt32(buf, off + targetOff + 8) : -1));
                         if (cbDims.TryGetValue(targetCb, out cd) && IsDisplaySize(cd[0], cd[1])) {
                             KeepColorBufferAlive(targetCb, cbPinned.TryAdd(targetCb, true) ? 2 : 0);
                             masterComposeCb = targetCb;

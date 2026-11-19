@@ -303,6 +303,15 @@ public class WhpxEmulatorBridge {
     }
 
     // The guest display runs at the host monitor's rate, so a 120 Hz screen gets 120 Hz.
+    /**
+     * Window blurs (notification shade, app drawer) are off unless WHPX_BLUR=1: they push the
+     * guest's composition from about 5 to 7.5 ms per frame, close to a 120 Hz frame's 8.3 ms,
+     * and the drawer and shade animations drop frames.
+     */
+    private static boolean blurEnabled() {
+        return "1".equals(System.getenv("WHPX_BLUR"));
+    }
+
     private static int hostRefreshRate() {
         try {
             int hz = java.awt.GraphicsEnvironment.getLocalGraphicsEnvironment()
@@ -2579,7 +2588,7 @@ public class WhpxEmulatorBridge {
 
 
 
-                "settings put global disable_window_blurs 0; " +
+                "settings put global disable_window_blurs " + (blurEnabled() ? 0 : 1) + "; " +
 
 
 
@@ -4020,6 +4029,7 @@ public class WhpxEmulatorBridge {
         // Without it large screens get neither a navigation bar nor the launcher's taskbar.
         if (!mainKeys) bc.append("androidboot.qemu.hw.mainkeys=\"0\"\n");
         bc.append(WhpxFold.bootConfig(lcdDensity));
+        if (blurEnabled()) bc.append("androidboot.whpx.blur=\"1\"\n");
         if (!skinCutout.isEmpty()) bc.append("androidboot.whpx.cutout=\"").append(skinCutout).append("\"\n");
         if (!skinName.isEmpty()) bc.append("androidboot.whpx.skin=\"").append(skinName).append("\"\n");
         bc.append("androidboot.whpx.gfx_port=\"").append(gfxPort).append("\"\n");

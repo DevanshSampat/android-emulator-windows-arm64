@@ -274,40 +274,53 @@ static void apply_boot_density(void) {
     run_cmd("/system/bin/sh", args);
 }
 
-/* androidboot.qemu.hw.mainkeys: the emulator sets qemu.hw.mainkeys=0 for devices without
- * hardware keys, and the images rely on it (config_showNavigationBar is false). The window
- * manager reads it once as system_server starts; without it large screens get neither a
- * navigation bar nor the launcher's taskbar. Read straight from /proc/bootconfig and set
- * with setprop directly, as for the adb properties. */
-static void apply_boot_mainkeys(void) {
-    char buf[16384];
-    int fd = open("/proc/bootconfig", O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return;
-    int n = read(fd, buf, sizeof(buf) - 1);
-    close(fd);
-    if (n <= 0) return;
-    buf[n] = 0;
-    const char* key = "androidboot.qemu.hw.mainkeys = \"";
-    char* p = strstr(buf, key);
-    if (!p) return;
-    p += strlen(key);
-    char val[4] = { 0 };
-    if (p[0] != '0' && p[0] != '1') return;
-    val[0] = p[0];
-    /* Android programs can't start until apexd has mounted the runtime APEX (the dynamic
-     * linker); exec fails with 127 until then. That is still well before system_server, so
-     * retry in a child without holding up the supervisor. */
-    if (fork() != 0) return;
-    char* a[] = { "/system/bin/setprop", "qemu.hw.mainkeys", val, NULL };
-    int rc = -1, tries = 0;
-    for (; tries < 600; tries++) {
+/* Properties Android reads once at startup, set as soon as Android programs can run.
+ *
+ * qemu.hw.mainkeys (from androidboot.qemu.hw.mainkeys): the emulator sets it to 0 for devices
+ * without hardware keys, and the images rely on it (config_showNavigationBar is false). The
+ * window manager reads it as system_server starts; without it large screens get neither a
+ * navigation bar nor the launcher's taskbar.
+ *
+ * ro.surface_flinger.max_frame_buffer_acquired_buffers=3: the renderer reads each posted frame
+ * back asynchronously. With SurfaceFlinger's default two display buffers it starts drawing the
+ * next frame into a buffer as soon as the other is posted, so a late read showed a half-drawn
+ * frame (with blur: one with only what is behind the blur). A third buffer gives the read a
+ * whole frame more. SurfaceFlinger reads it when it starts.
+ *
+ * Android programs can't start until apexd has mounted the runtime APEX (the dynamic linker);
+ * exec fails with 127 until then. That is still before SurfaceFlinger and system_server, so
+ * retry in a child without holding up the supervisor. */
+static int setprop_retry(const char* name, const char* val) {
+    char* a[] = { "/system/bin/setprop", (char*)name, (char*)val, NULL };
+    int rc = -1;
+    for (int tries = 0; tries < 600; tries++) {
         rc = run_cmd_status("/system/bin/setprop", a);
         if (rc != 127 && rc != -1) break;
-        usleep(50000);
+        usleep(20000);
     }
-    char msg[80];
-    snprintf(msg, sizeof(msg), "qemu.hw.mainkeys=%s (setprop rc %d after %d tries)", val, rc, tries + 1);
+    char msg[128];
+    snprintf(msg, sizeof(msg), "%s=%s (setprop rc %d)", name, val, rc);
     klog(msg);
+    return rc;
+}
+
+static void apply_early_props(void) {
+    char buf[16384];
+    char keys[4] = { 0 };
+    int fd = open("/proc/bootconfig", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        int n = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (n > 0) {
+            buf[n] = 0;
+            const char* key = "androidboot.qemu.hw.mainkeys = \"";
+            char* p = strstr(buf, key);
+            if (p && (p[strlen(key)] == '0' || p[strlen(key)] == '1')) keys[0] = p[strlen(key)];
+        }
+    }
+    if (fork() != 0) return;
+    setprop_retry("ro.surface_flinger.max_frame_buffer_acquired_buffers", "3");
+    if (keys[0]) setprop_retry("qemu.hw.mainkeys", keys);
     _exit(0);
 }
 
@@ -1185,7 +1198,7 @@ static void run_supervisor(void) {
     }
 
     apply_boot_density();
-    apply_boot_mainkeys();
+    apply_early_props();
 
     // Configure system properties via /system/bin/setprop directly
     if (access("/system/bin/setprop", X_OK) == 0) {
