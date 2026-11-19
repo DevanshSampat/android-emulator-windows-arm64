@@ -304,12 +304,16 @@ public class WhpxEmulatorBridge {
 
     // The guest display runs at the host monitor's rate, so a 120 Hz screen gets 120 Hz.
     /**
-     * Window blurs (notification shade, app drawer), as on a real device, unless WHPX_BLUR=0.
-     * They raise the guest's composition from about 5 to 7.5 ms per frame (8.3 ms at 120 Hz),
-     * so the drawer and shade animations drop some frames.
+     * Window blurs (notification shade, app drawer), as on a real device, on hosts with 12 or
+     * more cores. They raise the guest's composition from about 5 to 7.5 ms per frame (8.3 ms at
+     * 120 Hz, measured on a 12-core Snapdragon X), so smaller chips keep them off.
+     * WHPX_BLUR=1 or 0 overrides.
      */
     private static boolean blurEnabled() {
-        return !"0".equals(System.getenv("WHPX_BLUR"));
+        String env = System.getenv("WHPX_BLUR");
+        if ("1".equals(env)) return true;
+        if ("0".equals(env)) return false;
+        return Runtime.getRuntime().availableProcessors() >= 12;
     }
 
     private static int hostRefreshRate() {
@@ -4030,6 +4034,8 @@ public class WhpxEmulatorBridge {
         if (!mainKeys) bc.append("androidboot.qemu.hw.mainkeys=\"0\"\n");
         bc.append(WhpxFold.bootConfig(lcdDensity));
         bc.append("androidboot.whpx.blur=\"").append(blurEnabled() ? 1 : 0).append("\"\n");
+        System.out.println("[WhpxEmulatorBridge] window blurs " + (blurEnabled() ? "on" : "off") + " ("
+            + Runtime.getRuntime().availableProcessors() + " host cores" + (System.getenv("WHPX_BLUR") != null ? ", WHPX_BLUR=" + System.getenv("WHPX_BLUR") : "") + ")");
         if (!skinCutout.isEmpty()) bc.append("androidboot.whpx.cutout=\"").append(skinCutout).append("\"\n");
         if (!skinName.isEmpty()) bc.append("androidboot.whpx.skin=\"").append(skinName).append("\"\n");
         bc.append("androidboot.whpx.gfx_port=\"").append(gfxPort).append("\"\n");
