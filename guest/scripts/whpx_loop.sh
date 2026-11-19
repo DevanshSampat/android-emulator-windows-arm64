@@ -162,7 +162,8 @@ while true; do
       settings put global transition_animation_scale 1.0 2>/dev/null
       settings put global animator_duration_scale 1.0 2>/dev/null
       settings put global disable_hw_overlays 1 2>/dev/null
-      settings put global disable_window_blurs 1 2>/dev/null
+      # Blurs as on a real device on hosts with 12+ cores (about 2.5 ms more composition per frame); the bridge decides.
+      if [ "$(getprop ro.boot.whpx.blur)" = 0 ]; then settings put global disable_window_blurs 1 2>/dev/null; else settings put global disable_window_blurs 0 2>/dev/null; fi
       touch /dev/whpx_scales_done 2>/dev/null
     fi
   fi

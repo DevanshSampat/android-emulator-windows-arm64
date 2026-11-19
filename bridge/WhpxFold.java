@@ -10,12 +10,16 @@ import java.util.concurrent.TimeUnit;
  * Folding for foldable AVDs (hw.sensor.hinge=yes), such as the Pixel 10 Pro Fold.
  *
  * <p>Android Studio shows Closed / Half-open / Open when hardware-qemu.ini lists the hinge and
- * its postures, and sends the hinge angle with setPhysicalModel(HINGE_ANGLE0). The emulator has no
- * hinge sensor and one screen, so the guest is folded through Android's device states:
+ * its postures, and sends the hinge angle with setPhysicalModel(HINGE_ANGLE0).
+ *
+ * <p>As in Google's emulator, the guest has two screens: the inner one (display 0) and the cover
+ * screen (display 1, from ro.boot.qemu.external.displays), so the launcher and apps know the
+ * device folds and use their foldable layouts. Android's device states fold it:
  * /data/system/devicestate/device_state_configuration.xml gives it CLOSED (0), HALF_OPENED (1),
- * OPENED (2) and REAR_DISPLAY (3), matching the image's config_device_state_postures. It boots
- * open, and "cmd device_state state N" enters the others. Closed also gives the screen the outer
- * display's size, so apps lay out as on the cover screen.
+ * OPENED (2) and REAR_DISPLAY (3), matching the image's config_device_state_postures, and
+ * /data/system/displayconfig/display_layout_configuration.xml says which screen is on in each.
+ * It boots open, and "cmd device_state state N" enters the others. The renderer sends the cover
+ * screen's frames while that screen is the one composing.
  *
  * <p>The closed state must have DISPLAY_CONFIGURATION_OUTER_PRIMARY: the window manager's
  * per-posture auto-rotate setup looks up a state for each posture at startup and stops
@@ -36,6 +40,21 @@ final class WhpxFold {
     private WhpxFold() {}
 
     static boolean foldable() { return foldable; }
+
+    /** The cover screen's size, or null when this AVD doesn't fold. */
+    static int[] coverSize() {
+        return foldable && outerW > 0 && outerH > 0 ? new int[] { outerW, outerH } : null;
+    }
+
+    /**
+     * Boot properties for the cover screen as the guest's second display, as Google's emulator
+     * does for foldables: the composer reads ro.boot.qemu.external.displays (groups of
+     * id,width,height,dpi,flags). Empty when this AVD doesn't fold.
+     */
+    static String bootConfig(int dpi) {
+        if (!foldable || outerW <= 0 || outerH <= 0) return "";
+        return "androidboot.qemu.external.displays=\"1," + outerW + "," + outerH + "," + dpi + ",0\"\n";
+    }
     static float angle() { return angle; }
     static int posture() { return posture; }
 
@@ -114,93 +133,15 @@ final class WhpxFold {
     /** Shell commands that put the guest in the current posture. */
     static String guestCommands() {
         if (!foldable || !guestReady) return null;
-        // Android scales the density with the screen size, and does it again shortly after
-        // (when the device state's display layout applies), so keep setting it until it holds.
-        String keepDensity = "for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ \"$(wm density | tail -1)\" = \"Override density: " + density
+        // Each screen keeps its own density override, and a screen Android hasn't shown yet
+        // starts at its default, so set the device's density until it holds.
+        String keepDensity = "for i in 1 2 3 4 5 6 7 8 9 10; do [ \"$(wm density | tail -1)\" = \"Override density: " + density
                 + "\" ] || wm density " + density + "; sleep 1; done";
-        String innerCutout = "cmd overlay disable com.android.shell:WhpxCoverCutout >/dev/null 2>&1; "
-                + "cmd overlay disable com.android.shell:WhpxCoverCutoutRect >/dev/null 2>&1; ";
-        // Overlay changes reset the density too, so the cutout goes first and the density last.
         switch (posture) {
-            case CLOSED:
-                if (outerW <= 0 || outerH <= 0) return "cmd device_state state 0";
-                return coverCutout() + "sleep 1; cmd device_state state 0; wm size " + outerW + "x" + outerH + "; " + keepDensity;
-            case HALF_OPENED:
-                return innerCutout + "sleep 1; cmd device_state state 1; wm size reset; " + keepDensity;
-            default:
-                return innerCutout + "sleep 1; cmd device_state state reset; wm size reset; " + keepDensity;
+            case CLOSED: return "cmd device_state state 0; sleep 1; " + keepDensity;
+            case HALF_OPENED: return "cmd device_state state 1; sleep 1; " + keepDensity;
+            default: return "cmd device_state state reset; sleep 1; " + keepDensity;
         }
-    }
-
-    private static String coverCutoutCmds, coverCutoutSetup;
-
-    /**
-     * The cover screen's camera cutout, from the hole in the closed skin's mask. Without it the
-     * inner screen's cutout (a corner hole) stays, and the system UI draws it on the cover screen.
-     * Android takes cutouts in panel pixels and scales them by the screen's width, so the hole's
-     * cover-screen position is scaled back up.
-     */
-    private static String coverCutout() {
-        return coverCutoutCmds == null ? "" : coverCutoutCmds;
-    }
-
-    static void loadCoverCutout(File skinDir, int lcdWidth) {
-        coverCutoutCmds = null;
-        if (!foldable || skinDir == null || outerW <= 0 || lcdWidth <= 0) return;
-        try {
-            File mask = new File(new File(skinDir, "closed"), "mask.webp");
-            if (!mask.isFile()) mask = new File(new File(skinDir, "closed"), "mask.png");
-            if (!mask.isFile()) return;
-            java.awt.image.BufferedImage m = javax.imageio.ImageIO.read(mask);
-            if (m == null || m.getWidth() != outerW) return;
-            int[] hole = interiorHole(m);
-            if (hole == null) return;
-            double s = (double) outerW / lcdWidth;
-            double r = (hole[2] - hole[0] + 1) / 2.0 / s, cx = (hole[0] + hole[2] + 1) / 2.0 / s, cy = (hole[1] + hole[3] + 1) / 2.0 / s;
-            String path = String.format(java.util.Locale.ROOT, "m %.1f,%.1f a %.1f,%.1f 0 0 0 %.1f,0 %.1f,%.1f 0 0 0 %.1f,0 z @left",
-                    cx + r, cy, r, r, -2 * r, r, r, 2 * r);
-            String rect = String.format(java.util.Locale.ROOT, "m %.1f,%.1f h %.1f v %.1f h %.1f z @left",
-                    cx - r, cy - r, 2 * r, 2 * r, -2 * r);
-            // Fabricated once per boot (re-registering an overlay applies late, about 14 s on,
-            // and resets the density then); folding only enables and disables them.
-            coverCutoutSetup = "cmd overlay fabricate --target android --name WhpxCoverCutout android:string/config_mainBuiltInDisplayCutout string \"" + path + "\" >/dev/null 2>&1; "
-                    + "cmd overlay fabricate --target android --name WhpxCoverCutoutRect android:string/config_mainBuiltInDisplayCutoutRectApproximation string \"" + rect + "\" >/dev/null 2>&1; ";
-            coverCutoutCmds = "cmd overlay enable com.android.shell:WhpxCoverCutout >/dev/null 2>&1; cmd overlay enable com.android.shell:WhpxCoverCutoutRect >/dev/null 2>&1; ";
-            System.out.println("[WhpxFold] cover screen cutout at " + hole[0] + "," + hole[1] + "-" + hole[2] + "," + hole[3]);
-        } catch (Exception e) {
-            System.out.println("[WhpxFold] no cover screen cutout: " + e);
-        }
-    }
-
-    /** Bounds {x0, y0, x1, y1} of the opaque blob in the mask's top fifth that touches no edge. */
-    private static int[] interiorHole(java.awt.image.BufferedImage m) {
-        int w = m.getWidth(), h = Math.min(m.getHeight(), m.getHeight() / 5);
-        boolean[] seen = new boolean[w * h];
-        java.util.ArrayDeque<int[]> stack = new java.util.ArrayDeque<>();
-        for (int y = 0; y < h; y++) {
-            for (int x = 0; x < w; x++) {
-                if (seen[y * w + x] || (m.getRGB(x, y) >>> 24) < 128) continue;
-                int x0 = x, x1 = x, y0 = y, y1 = y, n = 0;
-                boolean edge = false;
-                stack.push(new int[] { x, y });
-                seen[y * w + x] = true;
-                while (!stack.isEmpty()) {
-                    int[] p = stack.pop();
-                    n++;
-                    x0 = Math.min(x0, p[0]); x1 = Math.max(x1, p[0]); y0 = Math.min(y0, p[1]); y1 = Math.max(y1, p[1]);
-                    if (p[0] == 0 || p[1] == 0 || p[0] == w - 1 || p[1] == h - 1) edge = true;
-                    int[][] nb = { { p[0] + 1, p[1] }, { p[0] - 1, p[1] }, { p[0], p[1] + 1 }, { p[0], p[1] - 1 } };
-                    for (int[] q : nb) {
-                        if (q[0] < 0 || q[1] < 0 || q[0] >= w || q[1] >= h || seen[q[1] * w + q[0]]) continue;
-                        if ((m.getRGB(q[0], q[1]) >>> 24) < 128) continue;
-                        seen[q[1] * w + q[0]] = true;
-                        stack.push(q);
-                    }
-                }
-                if (!edge && n > 50 && x1 - x0 < w / 4) return new int[] { x0, y0, x1, y1 };
-            }
-        }
-        return null;
     }
 
     /** The cover screen's size while closed (the guest's screen then has this size), else null. */
@@ -239,9 +180,36 @@ final class WhpxFold {
         return s.append("    </properties>\n  </device-state>\n").toString();
     }
 
+    /** Which screen is on in each device state: the cover screen closed and for the rear display. */
+    private static String layoutXml(String inner, String cover) {
+        StringBuilder s = new StringBuilder("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+            + "<!-- Written by the WHPX emulator bridge for foldable AVDs. -->\n<layouts>\n");
+        for (int st = 0; st <= 3; st++) {
+            String on = (st == 0 || st == 3) ? cover : inner, off = on.equals(cover) ? inner : cover;
+            s.append("  <layout>\n    <state>").append(st).append("</state>\n")
+             .append("    <display enabled=\"true\" defaultDisplay=\"true\"><address>").append(on).append("</address></display>\n")
+             .append("    <display enabled=\"false\"><address>").append(off).append("</address></display>\n  </layout>\n");
+        }
+        return s.append("</layouts>\n").toString();
+    }
+
+    /** Copies xml to dst in the guest if it differs; returns true when it changed. */
+    private static boolean install(String adbExe, String serial, String bridgeDir, String xml, String dst) throws Exception {
+        File tmp = new File(bridgeDir, "whpx_fold_" + serial.replaceAll("[^A-Za-z0-9]", "_") + ".xml");
+        Files.write(tmp.toPath(), xml.getBytes(StandardCharsets.UTF_8));
+        run(adbExe, serial, 30, "push", tmp.getPath(), "/data/local/tmp/whpx_fold.xml");
+        tmp.delete();
+        String dir = dst.substring(0, dst.lastIndexOf('/'));
+        String out = run(adbExe, serial, 15, "shell",
+            "cmp -s /data/local/tmp/whpx_fold.xml " + dst + " || { mkdir -p " + dir + " && cp /data/local/tmp/whpx_fold.xml " + dst
+            + " && chown -R system:system " + dir + " && chmod 644 " + dst + " && restorecon -R " + dir + " >/dev/null 2>&1; echo CHANGED; }; rm -f /data/local/tmp/whpx_fold.xml");
+        return out.contains("CHANGED");
+    }
+
     /**
-     * Installs the device states in the guest after boot. The first time, the framework restarts
-     * once to load them (about 15 s); later boots find them in /data. Then applies the posture.
+     * Installs the device states and the display layout in the guest after boot. The first time,
+     * the framework restarts once to load them (about 15 s); later boots find them in /data.
+     * Then applies the posture.
      */
     static void ensureGuest(String adbExe, String serial, String bridgeDir, java.util.function.Consumer<String> shell) {
         if (!foldable || serial == null) return;
@@ -251,16 +219,27 @@ final class WhpxFold {
             // whpx_loop.sh scales the density down with a narrower screen (for 4K TVs); the
             // cover screen keeps the device's density.
             run(adbExe, serial, 10, "shell", "setprop whpx.fold 1");
-            File tmp = new File(bridgeDir, "whpx_device_state_" + serial.replaceAll("[^A-Za-z0-9]", "_") + ".xml");
-            Files.write(tmp.toPath(), stateXml().getBytes(StandardCharsets.UTF_8));
-            run(adbExe, serial, 30, "push", tmp.getPath(), "/data/local/tmp/whpx_dsc.xml");
-            tmp.delete();
+            // Earlier builds folded by resizing the inner screen and adding a cutout overlay.
+            run(adbExe, serial, 15, "shell", "wm size reset; for o in WhpxCoverCutout WhpxCoverCutoutRect; do "
+                + "cmd overlay disable com.android.shell:$o >/dev/null 2>&1; done");
+            // The two screens' physical ids, as SurfaceFlinger names them (HWC displays 0 and 1).
+            java.util.regex.Matcher m = java.util.regex.Pattern.compile("Display (\\d+) \\(HWC display (\\d+)\\)")
+                .matcher(run(adbExe, serial, 10, "shell", "dumpsys SurfaceFlinger --display-id"));
+            String inner = null, cover = null;
+            while (m.find()) {
+                if (m.group(2).equals("0")) inner = m.group(1);
+                else if (m.group(2).equals("1")) cover = m.group(1);
+            }
             String dst = "/data/system/devicestate/device_state_configuration.xml";
-            String out = run(adbExe, serial, 15, "shell",
-                "cmp -s /data/local/tmp/whpx_dsc.xml " + dst + " || { mkdir -p /data/system/devicestate && cp /data/local/tmp/whpx_dsc.xml " + dst
-                + " && chown -R system:system /data/system/devicestate && chmod 644 " + dst + " && restorecon -R /data/system/devicestate >/dev/null 2>&1; echo CHANGED; }; rm -f /data/local/tmp/whpx_dsc.xml");
-            if (out.contains("CHANGED")) {
-                System.out.println("[WhpxFold] installed device states; restarting Android's framework once to load them");
+            String layout = "/data/system/displayconfig/display_layout_configuration.xml";
+            boolean changed = install(adbExe, serial, bridgeDir, stateXml(), dst);
+            if (inner != null && cover != null) {
+                changed |= install(adbExe, serial, bridgeDir, layoutXml(inner, cover), layout);
+            } else {
+                System.out.println("[WhpxFold] the guest has no cover screen display; folding keeps the inner screen");
+            }
+            if (changed) {
+                System.out.println("[WhpxFold] installed device states and display layout; restarting Android's framework once to load them");
                 String oldPid = run(adbExe, serial, 10, "shell", "pidof system_server").trim();
                 run(adbExe, serial, 10, "shell", "logcat -b crash -c; setprop ctl.restart zygote");
                 boolean up = false;
@@ -269,7 +248,7 @@ final class WhpxFold {
                     String crashes = run(adbExe, serial, 10, "shell", "logcat -d -b crash | grep -c 'FATAL EXCEPTION IN SYSTEM PROCESS'").trim();
                     if (parse(crashes, 0) >= 2) {
                         System.out.println("[WhpxFold] Android's framework did not start with the device states; removing them");
-                        run(adbExe, serial, 10, "shell", "rm -f " + dst + "; setprop ctl.restart zygote");
+                        run(adbExe, serial, 10, "shell", "rm -f " + dst + " " + layout + "; setprop ctl.restart zygote");
                         foldable = false;
                         return;
                     }
@@ -282,14 +261,9 @@ final class WhpxFold {
             String states = run(adbExe, serial, 10, "shell", "cmd device_state print-states 2>/dev/null | grep -c identifier=").trim();
             guestReady = parse(states, 0) >= 3;
             System.out.println("[WhpxFold] device states in guest: " + states + (guestReady ? "" : " (folding unavailable)"));
-            if (guestReady && coverCutoutSetup != null) {
-                // Fabricated disabled; the posture commands below enable them only when closed.
-                run(adbExe, serial, 30, "shell", coverCutoutSetup
-                    + "cmd overlay disable com.android.shell:WhpxCoverCutout >/dev/null 2>&1; cmd overlay disable com.android.shell:WhpxCoverCutoutRect >/dev/null 2>&1");
-            }
             String cmds = guestCommands();
-            // Always, open too: Android keeps the "wm size" override across boots, so a device
-            // shut down folded would otherwise start open with the cover screen's size.
+            // Always, open too: Android keeps the last device state's screen across a framework
+            // restart, and the density on the screen in use.
             if (cmds != null) shell.accept(cmds);
         } catch (Exception e) {
             System.out.println("[WhpxFold] setup failed: " + e);

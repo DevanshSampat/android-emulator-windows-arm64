@@ -448,9 +448,19 @@ final class WhpxStandaloneWindow {
             int dh = foldW > 0 ? foldH : (rot % 2 == 0) ? host.displayHeight() : host.displayWidth();
             int x = (int) Math.round((e.getX() - r.x) * (double) dw / r.width);
             int y = (int) Math.round((e.getY() - r.y) * (double) dh / r.height);
+            x = Math.max(0, Math.min(dw - 1, x));
+            y = Math.max(0, Math.min(dh - 1, y));
+            // Like Studio, send the point in the display's natural orientation (the bridge turns
+            // it to the current one): dw x dh is the screen as shown, turned by rot.
+            int nx = x, ny = y;
+            switch (rot & 3) {
+                case 1: nx = dh - y; ny = x; break;
+                case 2: nx = dw - x; ny = dh - y; break;
+                case 3: nx = y; ny = dw - x; break;
+                default: break;
+            }
             send(InputEvent.newBuilder().setMouseEvent(MouseEvent.newBuilder()
-                    .setX(Math.max(0, Math.min(dw - 1, x))).setY(Math.max(0, Math.min(dh - 1, y)))
-                    .setButtons(buttons).build()).build());
+                    .setX(nx).setY(ny).setButtons(buttons).build()).build());
         }
 
         private void drawScreen(Graphics2D g, BufferedImage img, Rectangle r) {

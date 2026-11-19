@@ -55,6 +55,92 @@ public class WhpxInputDaemon {
         injectSafely(ev, INJECT_MODE_ASYNC);
     }
 
+    // Multi-touch ("M n id x y ..."): the fingers down after the last event, ordered by id.
+    private static int[] mtIds = new int[0];
+    private static float[] mtX = new float[0], mtY = new float[0];
+    private static long mtDownTime = 0L;
+
+    private static void initFull() throws Exception {
+        if (obtainFull != null) return;
+        propsCls = Class.forName("android.view.MotionEvent$PointerProperties");
+        coordsCls = Class.forName("android.view.MotionEvent$PointerCoords");
+        setAxisValue = coordsCls.getMethod("setAxisValue", int.class, float.class);
+        obtainFull = Class.forName("android.view.MotionEvent").getMethod("obtain",
+                long.class, long.class, int.class, int.class,
+                java.lang.reflect.Array.newInstance(propsCls, 0).getClass(),
+                java.lang.reflect.Array.newInstance(coordsCls, 0).getClass(),
+                int.class, int.class, float.class, float.class, int.class, int.class, int.class, int.class);
+    }
+
+    /** Injects one touchscreen event with these fingers (tool type finger). */
+    private static void injectFingers(int action, int[] ids, float[] xs, float[] ys, long eventTime) throws Exception {
+        int n = ids.length;
+        Object pa = java.lang.reflect.Array.newInstance(propsCls, n);
+        Object ca = java.lang.reflect.Array.newInstance(coordsCls, n);
+        for (int i = 0; i < n; i++) {
+            Object props = propsCls.newInstance();
+            propsCls.getField("id").setInt(props, ids[i]);
+            propsCls.getField("toolType").setInt(props, 1); // TOOL_TYPE_FINGER
+            Object coords = coordsCls.newInstance();
+            coordsCls.getField("x").setFloat(coords, xs[i]);
+            coordsCls.getField("y").setFloat(coords, ys[i]);
+            coordsCls.getField("pressure").setFloat(coords, 1.0f);
+            coordsCls.getField("size").setFloat(coords, 1.0f);
+            java.lang.reflect.Array.set(pa, i, props);
+            java.lang.reflect.Array.set(ca, i, coords);
+        }
+        Object ev = obtainFull.invoke(null, mtDownTime, eventTime, action, n, pa, ca,
+                0, 0, 1.0f, 1.0f, 0, 0, SOURCE_TOUCHSCREEN, 0);
+        injectSafely(ev, INJECT_MODE_ASYNC);
+    }
+
+    private static int indexOf(int[] ids, int id) {
+        for (int i = 0; i < ids.length; i++) if (ids[i] == id) return i;
+        return -1;
+    }
+
+    /**
+     * Moves from the fingers down last time to these (pinch and other gestures): fingers that
+     * lifted go up one at a time (ACTION_POINTER_UP, ACTION_UP for the last), the rest move,
+     * then new fingers go down (ACTION_DOWN for the first, ACTION_POINTER_DOWN after).
+     */
+    private static void multiTouch(int[] ids, float[] xs, float[] ys, long now) throws Exception {
+        initFull();
+        // Lifted fingers.
+        for (int i = 0; i < mtIds.length; ) {
+            if (indexOf(ids, mtIds[i]) >= 0) { i++; continue; }
+            int action = mtIds.length == 1 ? 1 /* ACTION_UP */ : (6 /* ACTION_POINTER_UP */ | (i << 8));
+            injectFingers(action, mtIds, mtX, mtY, now);
+            int[] ni = new int[mtIds.length - 1];
+            float[] nx = new float[ni.length], ny = new float[ni.length];
+            for (int j = 0, k = 0; j < mtIds.length; j++) if (j != i) { ni[k] = mtIds[j]; nx[k] = mtX[j]; ny[k] = mtY[j]; k++; }
+            mtIds = ni; mtX = nx; mtY = ny;
+        }
+        // Fingers still down that moved.
+        boolean moved = false;
+        for (int i = 0; i < mtIds.length; i++) {
+            int j = indexOf(ids, mtIds[i]);
+            if (mtX[i] != xs[j] || mtY[i] != ys[j]) { mtX[i] = xs[j]; mtY[i] = ys[j]; moved = true; }
+        }
+        if (moved) injectFingers(2 /* ACTION_MOVE */, mtIds, mtX, mtY, now);
+        // New fingers, kept in id order.
+        for (int j = 0; j < ids.length; j++) {
+            if (indexOf(mtIds, ids[j]) >= 0) continue;
+            int pos = 0;
+            while (pos < mtIds.length && mtIds[pos] < ids[j]) pos++;
+            int[] ni = new int[mtIds.length + 1];
+            float[] nx = new float[ni.length], ny = new float[ni.length];
+            for (int a = 0, b = 0; a < ni.length; a++) {
+                if (a == pos) { ni[a] = ids[j]; nx[a] = xs[j]; ny[a] = ys[j]; }
+                else { ni[a] = mtIds[b]; nx[a] = mtX[b]; ny[a] = mtY[b]; b++; }
+            }
+            boolean first = mtIds.length == 0;
+            mtIds = ni; mtX = nx; mtY = ny;
+            if (first) mtDownTime = now;
+            injectFingers(first ? 0 /* ACTION_DOWN */ : (5 /* ACTION_POINTER_DOWN */ | (pos << 8)), mtIds, mtX, mtY, now);
+        }
+    }
+
     private static volatile long downTime = 0L;
     private static final ConcurrentHashMap<Integer, Long> keyTimes = new ConcurrentHashMap<>();
 
@@ -257,6 +343,18 @@ public class WhpxInputDaemon {
                 injectSafely(ev, INJECT_MODE_ASYNC);
                 if (action == 1) {
                     downTime = 0L;
+                }
+            } else if ("M".equals(cmd) && parts.length >= 2) {
+                int n = Integer.parseInt(parts[1]);
+                if (parts.length >= 2 + 3 * n) {
+                    int[] ids = new int[n];
+                    float[] xs = new float[n], ys = new float[n];
+                    for (int i = 0; i < n; i++) {
+                        ids[i] = Integer.parseInt(parts[2 + 3 * i]);
+                        xs[i] = Float.parseFloat(parts[3 + 3 * i]);
+                        ys[i] = Float.parseFloat(parts[4 + 3 * i]);
+                    }
+                    multiTouch(ids, xs, ys, now);
                 }
             } else if ("W".equals(cmd) && parts.length >= 5) {
                 injectScroll(Float.parseFloat(parts[1]), Float.parseFloat(parts[2]),
