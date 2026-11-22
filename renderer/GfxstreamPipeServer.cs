@@ -509,6 +509,41 @@ class GfxstreamPipeServer {
     static ConcurrentQueue<uint> idPool = new ConcurrentQueue<uint>(Enumerable.Range(10, 50).Select(x => (uint)x));
     static int nextId = 70;
     static volatile int activeDisplayCb = 0;
+    // The buffer on screen before activeDisplayCb, and the frame counter when it was replaced.
+    static volatile int prevDisplayCb = 0, prevPostSeq = 0;
+    static long activePostStamp = 0;
+#if CAPTURE_AB
+    static volatile bool capturePipeline = true; // test builds: toggled by %TEMP%\whpx_capture_pipeline_off
+#else
+    static readonly bool capturePipeline = Environment.GetEnvironmentVariable("WHPX_CAPTURE_PIPELINE") != "0";
+#endif
+    // Measurement only: running totals, written to %TEMP%\whpx_capture_stats.txt about once a
+    // second while the file %TEMP%\whpx_perf_capture exists. Guest posts vs published frames
+    // shows how many frames the capture drops.
+    static int statPosts = 0, statFrames = 0, statPipelined = 0, statReads = 0, statSame = 0;
+    static long statReadTicks = 0;
+    static long statWrittenAt = 0;
+    static void WriteCaptureStats() {
+        long now = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (now - statWrittenAt < System.Diagnostics.Stopwatch.Frequency) return;
+        statWrittenAt = now;
+#if CAPTURE_AB
+        capturePipeline = !System.IO.File.Exists(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "whpx_capture_pipeline_off"));
+#endif
+        try {
+            if (!System.IO.File.Exists(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "whpx_perf_capture"))) return;
+            System.IO.File.WriteAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "whpx_capture_stats.txt"),
+                "posts " + statPosts + " frames " + statFrames + " pipelined " + statPipelined + " pipeline " + (capturePipeline ? 1 : 0) + " reads " + statReads + " same " + statSame + " readMs " + (statReadTicks * 1000 / System.Diagnostics.Stopwatch.Frequency) + "\n");
+        } catch (Exception) { }
+    }
+    static void NoteDisplayPost(int cb) {
+        if (cb != activeDisplayCb) {
+            if (activeDisplayCb > 0) { prevDisplayCb = activeDisplayCb; prevPostSeq = frameDirtyCounter; }
+            Interlocked.Increment(ref statPosts);
+            activePostStamp = System.Diagnostics.Stopwatch.GetTimestamp();
+        }
+        activeDisplayCb = cb;
+    }
     static volatile int masterComposeCb = 0;
     // Ops are seen before the renderer runs them, and the buffers are reused in a cycle, so a
     // read that starts at once can return the frame that buffer held last time round.
@@ -910,6 +945,7 @@ class GfxstreamPipeServer {
             Console.WriteLine("[Capture] FrameCaptureLoop RenderThread active! RendererVersion=" + BitConverter.ToInt32(verBytes, 0));
 
             int lastCapturedSeq = 0;
+            int lastCapturedCb = 0; // the buffer read last: its final content is already published
             int currentSlot = 0;
             int scaleCb = 0, scaleW = 0, scaleH = 0;
             int lastReqW = -1, lastReqH = -1;
@@ -923,14 +959,31 @@ class GfxstreamPipeServer {
                 int reqW, reqH;
                 bool wantScaled = CaptureRequest(out reqW, out reqH);
                 if (targetCb <= 0 || (seq == lastCapturedSeq && reqW == lastReqW && reqH == lastReqH)) {
+                    WriteCaptureStats();
                     Thread.Sleep(1);
                     continue;
                 }
+                long sinceComposeMs = (System.Diagnostics.Stopwatch.GetTimestamp() - Math.Max(Interlocked.Read(ref lastComposeStamp), Interlocked.Read(ref activePostStamp))) * 1000 / System.Diagnostics.Stopwatch.Frequency;
+                if (sinceComposeMs >= 0 && sinceComposeMs < ComposeSettleMs) {
+                    // The newest frame may still be in the renderer's queue. The one before it is
+                    // finished (a newer frame was posted after it), and with three display buffers
+                    // the guest does not draw into it for two more frames: read that one now instead
+                    // of waiting. At 120 Hz the wait plus the read was longer than a frame, so
+                    // frames were dropped; this costs one frame of latency instead.
+                    int pcb = prevDisplayCb, pseq = prevPostSeq;
+                    if (capturePipeline && pcb > 0 && pcb != lastCapturedCb && pseq > lastCapturedSeq) {
+                        targetCb = pcb;
+                        seq = pseq;
+                        Interlocked.Increment(ref statPipelined);
+                    } else {
+                        Thread.Sleep(1);
+                        continue;
+                    }
+                }
                 lastCapturedSeq = seq;
+                lastCapturedCb = targetCb;
                 lastReqW = reqW;
                 lastReqH = reqH;
-                long sinceComposeMs = (System.Diagnostics.Stopwatch.GetTimestamp() - Interlocked.Read(ref lastComposeStamp)) * 1000 / System.Diagnostics.Stopwatch.Frequency;
-                if (sinceComposeMs >= 0 && sinceComposeMs < ComposeSettleMs) Thread.Sleep(ComposeSettleMs - (int)sinceComposeMs);
 
                 int[] dims;
                 int w = lcdWidth;
@@ -1035,6 +1088,8 @@ class GfxstreamPipeServer {
                     if (!ok) { if (CapDiag.TryAdd("read" + targetCb, true)) Console.WriteLine("[Capture] read stalled cb=" + targetCb + " got " + totalRead + "/" + needed); break; }
                 }
                 sw.Stop();
+                statReads++;
+                statReadTicks += sw.ElapsedTicks;
 
                 // The capture starts when a compose is seen in the guest's stream, which can be
                 // before the renderer has run it. Then the read returns the previous frame again
@@ -1050,6 +1105,7 @@ class GfxstreamPipeServer {
                         }
                     }
                     if (same) {
+                        statSame++;
                         if (sameRetries < 3) {
                             sameRetries++;
                             lastCapturedSeq = -1; // capture again without waiting for a new compose
@@ -1075,6 +1131,8 @@ class GfxstreamPipeServer {
                             Thread.MemoryBarrier();
                             *(int*)(sFramePtr + 0) = nextSeq;
                             currentSlot = writeSlot;
+                            statFrames++;
+                            WriteCaptureStats();
                             if (nextSeq % 60 == 1) {
                                 Console.WriteLine("[GfxstreamPipeServer] MMF frame " + nextSeq + " (slot=" + writeSlot + ") targetCb=" + targetCb + " written (" + w + "x" + h + ", read=" + sw.ElapsedMilliseconds + "ms)");
                             }
@@ -1287,7 +1345,7 @@ class GfxstreamPipeServer {
                         int[] cd;
                         bool composerActive = (masterComposeCb > 0) && (unchecked(Environment.TickCount - lastComposeTick) < 1500);
                         if (!composerActive && !hasSeenRealDisplayPost && cbDims.TryGetValue(cb, out cd) && cd[0] == lcdWidth && cd[1] == lcdHeight) {
-                            activeDisplayCb = cb;
+                            NoteDisplayPost(cb);
                             lastPostTick = Environment.TickCount;
                             Interlocked.Increment(ref frameDirtyCounter);
                         }
@@ -1304,7 +1362,7 @@ class GfxstreamPipeServer {
                         bool composerActive = (masterComposeCb > 0) && (unchecked(Environment.TickCount - lastComposeTick) < 1500);
                         if (!composerActive || cb == masterComposeCb) {
                             CapLog("FBPost cb=" + cb);
-                            activeDisplayCb = cb;
+                            NoteDisplayPost(cb);
                             lastDisplayPostTick = Environment.TickCount;
                             lastPostTick = Environment.TickCount;
                             Interlocked.Increment(ref frameDirtyCounter);
@@ -1320,7 +1378,7 @@ class GfxstreamPipeServer {
                         bool composerActive = (masterComposeCb > 0) && (unchecked(Environment.TickCount - lastComposeTick) < 1500);
                         if (!composerActive && !hasSeenRealDisplayPost && (!cbDims.TryGetValue(cb, out cd) || (cd[0] == lcdWidth && cd[1] == lcdHeight))) {
                             KeepColorBufferAlive(cb, cbPinned.TryAdd(cb, true) ? 2 : 0);
-                            activeDisplayCb = cb;
+                            NoteDisplayPost(cb);
                             lastPostTick = Environment.TickCount;
                             Interlocked.Increment(ref frameDirtyCounter);
                         }
@@ -1337,7 +1395,7 @@ class GfxstreamPipeServer {
                         masterComposeCb = cb;
                         lastComposeTick = Environment.TickCount;
                         lastComposeStamp = System.Diagnostics.Stopwatch.GetTimestamp();
-                        activeDisplayCb = cb;
+                        NoteDisplayPost(cb);
                         lastDisplayPostTick = Environment.TickCount;
                         lastPostTick = Environment.TickCount;
                         Interlocked.Increment(ref frameDirtyCounter);
@@ -1358,7 +1416,7 @@ class GfxstreamPipeServer {
                             masterComposeCb = targetCb;
                             lastComposeTick = Environment.TickCount;
                             lastComposeStamp = System.Diagnostics.Stopwatch.GetTimestamp();
-                            activeDisplayCb = targetCb;
+                            NoteDisplayPost(targetCb);
                             lastDisplayPostTick = Environment.TickCount;
                             lastPostTick = Environment.TickCount;
                             Interlocked.Increment(ref frameDirtyCounter);
