@@ -3112,22 +3112,37 @@ public class WhpxEmulatorBridge {
 
 
 
-            // The RAM set in Device Manager. Guests now have zram (compressed swap), so the
-            // 3 GB floor that once covered for its absence would cost the host 1 GB for nothing.
-            // A quarter of the host's RAM, or the RAM set in Device Manager if that is more; 2 to 8 GB.
-            // Studio creates most devices with 2 GB, which left Android 17 phones and foldables
-            // swapping to zram and janking. Wear keeps its own setting: a watch has no use for 4 GB.
-            boolean wearAvd = cfg.getOrDefault("tag.ids", cfg.getOrDefault("tag.id", "")).contains("android-wear");
+            // Guest RAM by form factor, as a share of the host's RAM:
+            //   phones and tablets  20%, 2 to 3 GB
+            //   foldables           25%, 2 to 4 GB (two screens' worth of apps)
+            //   Wear OS             1 GB
+            //   TV                  2 GB
+            // The 2 GB floor: below it, first boots of Android 17 ran out of memory before zram was
+            // up. A larger size set in Device Manager still wins, up to 8 GB. The guest's RAM is
+            // kept resident on the host (WhpxHostTuning), so these caps leave room for Studio
+            // and Gradle on 16 GB PCs.
+            String ramTags = cfg.getOrDefault("tag.ids", cfg.getOrDefault("tag.id", ""));
+            boolean wearAvd = ramTags.contains("android-wear");
+            boolean tvAvd = ramTags.contains("android-tv") || ramTags.contains("google-tv");
+            boolean foldAvd = "yes".equalsIgnoreCase(cfg.getOrDefault("hw.sensor.hinge", "no").trim());
             long hostRamMb = 0;
             try {
                 java.lang.management.OperatingSystemMXBean os = java.lang.management.ManagementFactory.getOperatingSystemMXBean();
                 if (os instanceof com.sun.management.OperatingSystemMXBean sun) hostRamMb = sun.getTotalMemorySize() >> 20;
             } catch (Throwable ignored) {}
-            // Rounded to 256 MB: Windows reports a 16 GB PC as about 15.6 GB, which still gives 4 GB.
-            int quarter = (int) (Math.round(hostRamMb / 4.0 / 256.0) * 256);
-            int wantedRam = wearAvd ? rawRam : Math.max(rawRam, quarter);
-            ramMb = Math.max(2048, Math.min(8192, wantedRam));
-            System.out.println("[WhpxEmulatorBridge] RAM: host " + hostRamMb + " MB, Device Manager " + rawRam + " MB -> guest " + ramMb + " MB");
+            int byType;
+            if (wearAvd) {
+                byType = 1024;
+            } else if (tvAvd) {
+                byType = 2048;
+            } else {
+                // Rounded to 256 MB: Windows reports a 16 GB PC as about 15.6 GB.
+                int share = (int) (Math.round(hostRamMb * (foldAvd ? 0.25 : 0.20) / 256.0) * 256);
+                byType = Math.max(2048, Math.min(foldAvd ? 4096 : 3072, share));
+            }
+            ramMb = Math.min(8192, Math.max(byType, rawRam));
+            System.out.println("[WhpxEmulatorBridge] RAM: host " + hostRamMb + " MB, " + (wearAvd ? "Wear" : tvAvd ? "TV" : foldAvd ? "foldable" : "phone/tablet")
+                + ", Device Manager " + rawRam + " MB -> guest " + ramMb + " MB");
             WhpxFold.configure(cfg, lcdDensity);
 
 
