@@ -600,6 +600,23 @@ public class WhpxEmulatorBridge {
         }
     }
 
+    // The guest's video decoders send each decoded frame to the renderer over their own
+    // connection, and the framework restart that follows a renderer restart leaves them
+    // running: still connected to the dead renderer, so every video played black. Stop them;
+    // init starts them again, connected to the new renderer.
+    private static void restartGuestVideoDecoders() {
+        try {
+            Process p = new ProcessBuilder(sdkDir + "\\platform-tools\\adb.exe", "-s", emulatorSerial, "shell",
+                "for n in media.swcodec android.hardware.media.c2-service-goldfish; do p=$(pidof $n); [ -n \"$p\" ] && kill $p; done")
+                .redirectErrorStream(true).start();
+            p.getInputStream().readAllBytes();
+            p.waitFor(15, TimeUnit.SECONDS);
+            System.out.println("[WhpxEmulatorBridge] Restarted guest video decoders");
+        } catch (Exception e) {
+            System.out.println("[WhpxEmulatorBridge] Could not restart guest video decoders: " + e);
+        }
+    }
+
     // The whole guest display depends on this process. If it dies, SurfaceFlinger
     // aborts and Android can never come back, so restart it (the guest framework
     // reconnects by itself) and record how it died, since nothing else shows that.
@@ -633,6 +650,7 @@ public class WhpxEmulatorBridge {
                     System.out.println("[WhpxEmulatorBridge] Renderer restarted");
                     Thread.sleep(2000);
                     sendGpsToRenderer();
+                    restartGuestVideoDecoders();
                 } catch (Exception e) {
                     System.out.println("[WhpxEmulatorBridge] Renderer supervisor stopped: " + e);
                     return;
@@ -3112,22 +3130,37 @@ public class WhpxEmulatorBridge {
 
 
 
-            // The RAM set in Device Manager. Guests now have zram (compressed swap), so the
-            // 3 GB floor that once covered for its absence would cost the host 1 GB for nothing.
-            // A quarter of the host's RAM, or the RAM set in Device Manager if that is more; 2 to 8 GB.
-            // Studio creates most devices with 2 GB, which left Android 17 phones and foldables
-            // swapping to zram and janking. Wear keeps its own setting: a watch has no use for 4 GB.
-            boolean wearAvd = cfg.getOrDefault("tag.ids", cfg.getOrDefault("tag.id", "")).contains("android-wear");
+            // Guest RAM by form factor, as a share of the host's RAM:
+            //   phones and tablets  20%, 2 to 3 GB
+            //   foldables           25%, 2 to 4 GB (two screens' worth of apps)
+            //   Wear OS             1 GB
+            //   TV                  2 GB
+            // The 2 GB floor: below it, first boots of Android 17 ran out of memory before zram was
+            // up. A larger size set in Device Manager still wins, up to 8 GB. The guest's RAM is
+            // kept resident on the host (WhpxHostTuning), so these caps leave room for Studio
+            // and Gradle on 16 GB PCs.
+            String ramTags = cfg.getOrDefault("tag.ids", cfg.getOrDefault("tag.id", ""));
+            boolean wearAvd = ramTags.contains("android-wear");
+            boolean tvAvd = ramTags.contains("android-tv") || ramTags.contains("google-tv");
+            boolean foldAvd = "yes".equalsIgnoreCase(cfg.getOrDefault("hw.sensor.hinge", "no").trim());
             long hostRamMb = 0;
             try {
                 java.lang.management.OperatingSystemMXBean os = java.lang.management.ManagementFactory.getOperatingSystemMXBean();
                 if (os instanceof com.sun.management.OperatingSystemMXBean sun) hostRamMb = sun.getTotalMemorySize() >> 20;
             } catch (Throwable ignored) {}
-            // Rounded to 256 MB: Windows reports a 16 GB PC as about 15.6 GB, which still gives 4 GB.
-            int quarter = (int) (Math.round(hostRamMb / 4.0 / 256.0) * 256);
-            int wantedRam = wearAvd ? rawRam : Math.max(rawRam, quarter);
-            ramMb = Math.max(2048, Math.min(8192, wantedRam));
-            System.out.println("[WhpxEmulatorBridge] RAM: host " + hostRamMb + " MB, Device Manager " + rawRam + " MB -> guest " + ramMb + " MB");
+            int byType;
+            if (wearAvd) {
+                byType = 1024;
+            } else if (tvAvd) {
+                byType = 2048;
+            } else {
+                // Rounded to 256 MB: Windows reports a 16 GB PC as about 15.6 GB.
+                int share = (int) (Math.round(hostRamMb * (foldAvd ? 0.25 : 0.20) / 256.0) * 256);
+                byType = Math.max(2048, Math.min(foldAvd ? 4096 : 3072, share));
+            }
+            ramMb = Math.min(8192, Math.max(byType, rawRam));
+            System.out.println("[WhpxEmulatorBridge] RAM: host " + hostRamMb + " MB, " + (wearAvd ? "Wear" : tvAvd ? "TV" : foldAvd ? "foldable" : "phone/tablet")
+                + ", Device Manager " + rawRam + " MB -> guest " + ramMb + " MB");
             WhpxFold.configure(cfg, lcdDensity);
 
 
@@ -5798,6 +5831,113 @@ public class WhpxEmulatorBridge {
         public void getGps(Empty req, StreamObserver<GpsState> resp) {
             resp.onNext(GpsState.newBuilder().setLatitude(gpsLat).setLongitude(gpsLon).setAltitude(gpsAlt).setSatellites(8).build());
             resp.onCompleted();
+        }
+
+        // ---- Studio's own Battery, Device Pose, Fingerprint and Phone dialogs (Rabbit 3 and later)
+
+        /** Runs an adb shell command in the guest and returns its output ("" on failure). */
+        private static String guestShellOutput(String cmd, int seconds) {
+            try {
+                Process p = new ProcessBuilder(sdkDir + "\\platform-tools\\adb.exe", "-s", emulatorSerial, "shell", cmd)
+                    .redirectErrorStream(true).start();
+                byte[] out = p.getInputStream().readAllBytes();
+                p.waitFor(seconds, TimeUnit.SECONDS);
+                return new String(out, StandardCharsets.UTF_8);
+            } catch (Exception e) {
+                return "";
+            }
+        }
+
+        @Override
+        public void getBattery(Empty req, StreamObserver<BatteryState> resp) {
+            // dumpsys battery lists "  AC powered: true", "  status: 2", "  health: 2", "  level: 100".
+            Map<String, String> v = new HashMap<>();
+            for (String line : guestShellOutput("dumpsys battery", 10).split("\\R")) {
+                int i = line.indexOf(':');
+                if (i > 0) v.put(line.substring(0, i).trim(), line.substring(i + 1).trim());
+            }
+            BatteryState.BatteryCharger charger = "true".equals(v.get("AC powered")) ? BatteryState.BatteryCharger.AC
+                : "true".equals(v.get("USB powered")) ? BatteryState.BatteryCharger.USB
+                : "true".equals(v.get("Wireless powered")) ? BatteryState.BatteryCharger.WIRELESS
+                : BatteryState.BatteryCharger.NONE;
+            BatteryState.BatteryStatus status;
+            switch (v.getOrDefault("status", "")) {
+                case "2": status = BatteryState.BatteryStatus.CHARGING; break;
+                case "3": status = BatteryState.BatteryStatus.DISCHARGING; break;
+                case "4": status = BatteryState.BatteryStatus.NOT_CHARGING; break;
+                case "5": status = BatteryState.BatteryStatus.FULL; break;
+                default: status = BatteryState.BatteryStatus.UNKNOWN; break;
+            }
+            BatteryState.BatteryHealth health;
+            switch (v.getOrDefault("health", "")) {
+                case "2": health = BatteryState.BatteryHealth.GOOD; break;
+                case "3": health = BatteryState.BatteryHealth.OVERHEATED; break;
+                case "4": health = BatteryState.BatteryHealth.DEAD; break;
+                case "5": health = BatteryState.BatteryHealth.OVERVOLTAGE; break;
+                case "6": health = BatteryState.BatteryHealth.FAILED; break;
+                default: health = BatteryState.BatteryHealth.GOOD; break;
+            }
+            int level = 100;
+            try { level = Integer.parseInt(v.getOrDefault("level", "100")); } catch (NumberFormatException ignored) {}
+            resp.onNext(BatteryState.newBuilder().setHasBattery(true).setIsPresent(!"false".equals(v.get("present")))
+                .setCharger(charger).setChargeLevel(level).setHealth(health).setStatus(status).build());
+            resp.onCompleted();
+        }
+
+        @Override
+        public void setBattery(BatteryState req, StreamObserver<Empty> resp) {
+            int level = Math.max(0, Math.min(100, req.getChargeLevel()));
+            int ac = req.getCharger() == BatteryState.BatteryCharger.AC ? 1 : 0;
+            int usb = req.getCharger() == BatteryState.BatteryCharger.USB ? 1 : 0;
+            int wireless = req.getCharger() == BatteryState.BatteryCharger.WIRELESS ? 1 : 0;
+            int status;
+            switch (req.getStatus()) {
+                case CHARGING: status = 2; break;
+                case DISCHARGING: status = 3; break;
+                case NOT_CHARGING: status = 4; break;
+                case FULL: status = 5; break;
+                default: status = 1; break;
+            }
+            int health;
+            switch (req.getHealth()) {
+                case OVERHEATED: health = 3; break;
+                case DEAD: health = 4; break;
+                case OVERVOLTAGE: health = 5; break;
+                case FAILED: health = 6; break;
+                default: health = 2; break;
+            }
+            // whpx_loop.sh re-applies the whpx.batt.* properties, so the state survives its next tick.
+            guestShellOutput("setprop whpx.batt.level " + level + "; setprop whpx.batt.ac " + ac
+                + "; setprop whpx.batt.status " + status + "; cmd battery set level " + level
+                + "; cmd battery set ac " + ac + "; cmd battery set usb " + usb + "; cmd battery set wireless " + wireless
+                + "; cmd battery set status " + status + "; cmd battery set health " + health
+                + "; cmd battery set present " + (req.getIsPresent() || !req.getHasBattery() ? 1 : 0), 10);
+            resp.onNext(Empty.getDefaultInstance());
+            resp.onCompleted();
+        }
+
+        // The guest has no virtual sensor service: report that, and accept values without effect.
+        @Override
+        public void getSensor(SensorValue req, StreamObserver<SensorValue> resp) {
+            resp.onNext(SensorValue.newBuilder().setTarget(req.getTarget()).setStatus(SensorValue.State.NO_SERVICE)
+                .setValue(ParameterValue.newBuilder().addData(0f).addData(0f).addData(0f)).build());
+            resp.onCompleted();
+        }
+
+        @Override
+        public void setSensor(SensorValue req, StreamObserver<Empty> resp) {
+            resp.onNext(Empty.getDefaultInstance());
+            resp.onCompleted();
+        }
+
+        @Override
+        public void sendFingerprint(Fingerprint req, StreamObserver<Empty> resp) {
+            resp.onError(Status.UNAVAILABLE.withDescription("This emulator has no virtual fingerprint sensor.").asRuntimeException());
+        }
+
+        @Override
+        public void sendSms(SmsMessage req, StreamObserver<PhoneResponse> resp) {
+            resp.onError(Status.UNAVAILABLE.withDescription("This emulator has no telephony, so it cannot receive SMS.").asRuntimeException());
         }
 
         @Override
