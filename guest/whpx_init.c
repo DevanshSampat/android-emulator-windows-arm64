@@ -775,7 +775,9 @@ static void empty_sensor_config(void) {
  * eth0 is this VM's private link to the host, so declare neither feature. */
 static void hide_ethernet_feature(void) {
     static const char* const dirs[] = { "/vendor", "/system", "/product", "/odm", "/system_ext" };
-    static const char* const files[] = { "android.hardware.ethernet.xml", "android.hardware.usb.host.xml" };
+    /* uwb: declared by the image for the emulator's UWB virtio port, which this emulator lacks; system_server
+     * then retried the HAL every second, flooding the serial console. */
+    static const char* const files[] = { "android.hardware.ethernet.xml", "android.hardware.usb.host.xml", "android.hardware.uwb.xml" };
     static const char staged[] = "/dev/.whpx_gfx/no_feature.xml";
     static const char body[] = "<permissions/>";
     int ready = 0;
