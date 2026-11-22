@@ -600,6 +600,23 @@ public class WhpxEmulatorBridge {
         }
     }
 
+    // The guest's video decoders send each decoded frame to the renderer over their own
+    // connection, and the framework restart that follows a renderer restart leaves them
+    // running: still connected to the dead renderer, so every video played black. Stop them;
+    // init starts them again, connected to the new renderer.
+    private static void restartGuestVideoDecoders() {
+        try {
+            Process p = new ProcessBuilder(sdkDir + "\\platform-tools\\adb.exe", "-s", emulatorSerial, "shell",
+                "for n in media.swcodec android.hardware.media.c2-service-goldfish; do p=$(pidof $n); [ -n \"$p\" ] && kill $p; done")
+                .redirectErrorStream(true).start();
+            p.getInputStream().readAllBytes();
+            p.waitFor(15, TimeUnit.SECONDS);
+            System.out.println("[WhpxEmulatorBridge] Restarted guest video decoders");
+        } catch (Exception e) {
+            System.out.println("[WhpxEmulatorBridge] Could not restart guest video decoders: " + e);
+        }
+    }
+
     // The whole guest display depends on this process. If it dies, SurfaceFlinger
     // aborts and Android can never come back, so restart it (the guest framework
     // reconnects by itself) and record how it died, since nothing else shows that.
@@ -633,6 +650,7 @@ public class WhpxEmulatorBridge {
                     System.out.println("[WhpxEmulatorBridge] Renderer restarted");
                     Thread.sleep(2000);
                     sendGpsToRenderer();
+                    restartGuestVideoDecoders();
                 } catch (Exception e) {
                     System.out.println("[WhpxEmulatorBridge] Renderer supervisor stopped: " + e);
                     return;
