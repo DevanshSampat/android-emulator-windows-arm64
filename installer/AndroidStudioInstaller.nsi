@@ -1,5 +1,5 @@
 ; ============================================================================
-; Android Studio 2026.2.2 (Windows ARM64) NSIS Setup Script
+; Android Studio 2026.2.3 (Windows ARM64) NSIS Setup Script
 ; Built for Windows on ARM (Snapdragon X Elite / X Plus / ARM64 PCs)
 ; Includes Native ARM64 Layoutlib & Compose Previews Pre-Configured
 ; Unofficial, independent build. Not affiliated with Google.
@@ -12,8 +12,8 @@
 
 ; General Configuration
 Name "Android Studio"
-Caption "Android Studio 2026.2.2 for Windows ARM64 (Unofficial) Setup"
-OutFile "AndroidStudio-2026.2.2-Windows-ARM64-Setup.exe"
+Caption "Android Studio 2026.2.3 for Windows ARM64 (Unofficial) Setup"
+OutFile "AndroidStudio-2026.2.3-Windows-ARM64-Setup.exe"
 InstallDir "$PROGRAMFILES64\Android\Android Studio"
 InstallDirRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\App Paths\studio64.exe" "Path"
 !ifdef TESTBUILD
@@ -38,7 +38,7 @@ SetCompressor /SOLID zlib
 ; ============================================================================
 ; Welcome page
 !define MUI_WELCOMEPAGE_TITLE "Android Studio Setup for Windows ARM64 (Unofficial)"
-!define MUI_WELCOMEPAGE_TEXT "This wizard installs an unofficial, independent Windows ARM64 build of Android Studio 2026.2.2 and an Android Emulator.$\r$\n$\r$\nThis project is not made, endorsed or supported by Google."
+!define MUI_WELCOMEPAGE_TEXT "This wizard installs an unofficial, independent Windows ARM64 build of Android Studio 2026.2.3 and an Android Emulator.$\r$\n$\r$\nThis project is not made, endorsed or supported by Google."
 !insertmacro MUI_PAGE_WELCOME
 
 ; License page
@@ -153,7 +153,7 @@ Section "Android Studio Core" SecCore
   File "skins.7z"
   SetCompress auto
   
-  DetailPrint "Extracting Android Studio 2026.2.2 ARM64 distribution..."
+  DetailPrint "Extracting Android Studio 2026.2.3 ARM64 distribution..."
   DetailPrint "Installation path: $INSTDIR"
   
   ; Execute multi-threaded native ARM64 7-zip decompression directly to $INSTDIR
@@ -273,7 +273,7 @@ Section "Android Studio Core" SecCore
   ; 5. Native 64-bit Windows Installed Apps (Control Panel / Settings)
   ; ==========================================================================
   WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\AndroidStudioARM64" "DisplayName" "Android Studio"
-  WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\AndroidStudioARM64" "DisplayVersion" "2026.2.2"
+  WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\AndroidStudioARM64" "DisplayVersion" "2026.2.3"
   WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\AndroidStudioARM64" "Publisher" "Devansh Sampat"
   WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\AndroidStudioARM64" "DisplayIcon" "$INSTDIR\bin\studio.ico,0"
   WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\AndroidStudioARM64" "UninstallString" '"$INSTDIR\uninstall.exe"'
