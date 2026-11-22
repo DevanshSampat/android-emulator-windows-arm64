@@ -5800,6 +5800,113 @@ public class WhpxEmulatorBridge {
             resp.onCompleted();
         }
 
+        // ---- Studio's own Battery, Device Pose, Fingerprint and Phone dialogs (Rabbit 3 and later)
+
+        /** Runs an adb shell command in the guest and returns its output ("" on failure). */
+        private static String guestShellOutput(String cmd, int seconds) {
+            try {
+                Process p = new ProcessBuilder(sdkDir + "\\platform-tools\\adb.exe", "-s", emulatorSerial, "shell", cmd)
+                    .redirectErrorStream(true).start();
+                byte[] out = p.getInputStream().readAllBytes();
+                p.waitFor(seconds, TimeUnit.SECONDS);
+                return new String(out, StandardCharsets.UTF_8);
+            } catch (Exception e) {
+                return "";
+            }
+        }
+
+        @Override
+        public void getBattery(Empty req, StreamObserver<BatteryState> resp) {
+            // dumpsys battery lists "  AC powered: true", "  status: 2", "  health: 2", "  level: 100".
+            Map<String, String> v = new HashMap<>();
+            for (String line : guestShellOutput("dumpsys battery", 10).split("\\R")) {
+                int i = line.indexOf(':');
+                if (i > 0) v.put(line.substring(0, i).trim(), line.substring(i + 1).trim());
+            }
+            BatteryState.BatteryCharger charger = "true".equals(v.get("AC powered")) ? BatteryState.BatteryCharger.AC
+                : "true".equals(v.get("USB powered")) ? BatteryState.BatteryCharger.USB
+                : "true".equals(v.get("Wireless powered")) ? BatteryState.BatteryCharger.WIRELESS
+                : BatteryState.BatteryCharger.NONE;
+            BatteryState.BatteryStatus status;
+            switch (v.getOrDefault("status", "")) {
+                case "2": status = BatteryState.BatteryStatus.CHARGING; break;
+                case "3": status = BatteryState.BatteryStatus.DISCHARGING; break;
+                case "4": status = BatteryState.BatteryStatus.NOT_CHARGING; break;
+                case "5": status = BatteryState.BatteryStatus.FULL; break;
+                default: status = BatteryState.BatteryStatus.UNKNOWN; break;
+            }
+            BatteryState.BatteryHealth health;
+            switch (v.getOrDefault("health", "")) {
+                case "2": health = BatteryState.BatteryHealth.GOOD; break;
+                case "3": health = BatteryState.BatteryHealth.OVERHEATED; break;
+                case "4": health = BatteryState.BatteryHealth.DEAD; break;
+                case "5": health = BatteryState.BatteryHealth.OVERVOLTAGE; break;
+                case "6": health = BatteryState.BatteryHealth.FAILED; break;
+                default: health = BatteryState.BatteryHealth.GOOD; break;
+            }
+            int level = 100;
+            try { level = Integer.parseInt(v.getOrDefault("level", "100")); } catch (NumberFormatException ignored) {}
+            resp.onNext(BatteryState.newBuilder().setHasBattery(true).setIsPresent(!"false".equals(v.get("present")))
+                .setCharger(charger).setChargeLevel(level).setHealth(health).setStatus(status).build());
+            resp.onCompleted();
+        }
+
+        @Override
+        public void setBattery(BatteryState req, StreamObserver<Empty> resp) {
+            int level = Math.max(0, Math.min(100, req.getChargeLevel()));
+            int ac = req.getCharger() == BatteryState.BatteryCharger.AC ? 1 : 0;
+            int usb = req.getCharger() == BatteryState.BatteryCharger.USB ? 1 : 0;
+            int wireless = req.getCharger() == BatteryState.BatteryCharger.WIRELESS ? 1 : 0;
+            int status;
+            switch (req.getStatus()) {
+                case CHARGING: status = 2; break;
+                case DISCHARGING: status = 3; break;
+                case NOT_CHARGING: status = 4; break;
+                case FULL: status = 5; break;
+                default: status = 1; break;
+            }
+            int health;
+            switch (req.getHealth()) {
+                case OVERHEATED: health = 3; break;
+                case DEAD: health = 4; break;
+                case OVERVOLTAGE: health = 5; break;
+                case FAILED: health = 6; break;
+                default: health = 2; break;
+            }
+            // whpx_loop.sh re-applies the whpx.batt.* properties, so the state survives its next tick.
+            guestShellOutput("setprop whpx.batt.level " + level + "; setprop whpx.batt.ac " + ac
+                + "; setprop whpx.batt.status " + status + "; cmd battery set level " + level
+                + "; cmd battery set ac " + ac + "; cmd battery set usb " + usb + "; cmd battery set wireless " + wireless
+                + "; cmd battery set status " + status + "; cmd battery set health " + health
+                + "; cmd battery set present " + (req.getIsPresent() || !req.getHasBattery() ? 1 : 0), 10);
+            resp.onNext(Empty.getDefaultInstance());
+            resp.onCompleted();
+        }
+
+        // The guest has no virtual sensor service: report that, and accept values without effect.
+        @Override
+        public void getSensor(SensorValue req, StreamObserver<SensorValue> resp) {
+            resp.onNext(SensorValue.newBuilder().setTarget(req.getTarget()).setStatus(SensorValue.State.NO_SERVICE)
+                .setValue(ParameterValue.newBuilder().addData(0f).addData(0f).addData(0f)).build());
+            resp.onCompleted();
+        }
+
+        @Override
+        public void setSensor(SensorValue req, StreamObserver<Empty> resp) {
+            resp.onNext(Empty.getDefaultInstance());
+            resp.onCompleted();
+        }
+
+        @Override
+        public void sendFingerprint(Fingerprint req, StreamObserver<Empty> resp) {
+            resp.onError(Status.UNAVAILABLE.withDescription("This emulator has no virtual fingerprint sensor.").asRuntimeException());
+        }
+
+        @Override
+        public void sendSms(SmsMessage req, StreamObserver<PhoneResponse> resp) {
+            resp.onError(Status.UNAVAILABLE.withDescription("This emulator has no telephony, so it cannot receive SMS.").asRuntimeException());
+        }
+
         @Override
         public void getVmState(Empty req, StreamObserver<VmRunState> resp) {
 

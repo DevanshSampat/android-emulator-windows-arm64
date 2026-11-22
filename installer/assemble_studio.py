@@ -1,11 +1,14 @@
 """Assemble Android Studio for Windows ARM64 from Google's release and JetBrains' ARM64 natives.
 
-usage: assemble_studio.py <studio> <idea> <layoutlib_dir> <out> [--label TEXT]
+usage: assemble_studio.py <studio> <idea> <layoutlib_dir> <out> [--label TEXT] [--jbr DIR]
 
   <studio>         Google's Android Studio for Windows, extracted (the folder holding product-info.json)
   <idea>           IntelliJ IDEA for Windows ARM64 on the same platform build, extracted
   <layoutlib_dir>  folder with ARM64 layoutlib_jni.dll and libandroid_runtime.dll
   <out>            output folder, replaced
+  --jbr DIR        an ARM64 JetBrains Runtime to use instead of IntelliJ's, for when Studio ships a
+                   newer runtime than the matching IntelliJ (JetBrains publishes each JBR build for
+                   windows-aarch64); it must be the same version as Studio's
 
 Google's Java code is used unchanged: it is the same on every platform. Only the parts that load
 into the IDE's own process have to be ARM64: the Java runtime, the launcher and its helpers, and the
@@ -29,6 +32,7 @@ ap.add_argument('idea')
 ap.add_argument('layoutlib')
 ap.add_argument('out')
 ap.add_argument('--label', default='Unofficial Windows ARM64 build')
+ap.add_argument('--jbr', help="ARM64 JetBrains Runtime folder (holding release) to use instead of IntelliJ's")
 a = ap.parse_args()
 
 
@@ -55,18 +59,24 @@ if i_info['buildNumber'].split('.')[:3] != platform:
     sys.exit('platform mismatch: Studio %s, IntelliJ %s' % (s_info['buildNumber'], i_info['buildNumber']))
 
 
-def release(root):
+def release(jbr):
     r = {}
-    for line in open(os.path.join(root, 'jbr', 'release'), encoding='utf8'):
+    for line in open(os.path.join(jbr, 'release'), encoding='utf8'):
         if '=' in line:
             k, v = line.split('=', 1)
             r[k] = v.strip().strip('"')
     return r
 
 
-if release(a.studio)['JAVA_VERSION'] != release(a.idea)['JAVA_VERSION']:
-    sys.exit('runtime mismatch: %s vs %s' % (release(a.studio)['JAVA_VERSION'], release(a.idea)['JAVA_VERSION']))
-print('Studio', s_info['version'], '| IntelliJ', i_info['buildNumber'], '| runtime', release(a.idea)['JAVA_VERSION'])
+JBR = a.jbr or os.path.join(a.idea, 'jbr')
+s_jbr, a_jbr = release(os.path.join(a.studio, 'jbr')), release(JBR)
+if s_jbr['JAVA_VERSION'] != a_jbr['JAVA_VERSION']:
+    sys.exit("runtime mismatch: %s vs %s (pass --jbr with an ARM64 JBR of Studio's version)"
+             % (s_jbr['JAVA_VERSION'], a_jbr['JAVA_VERSION']))
+if a_jbr.get('OS_ARCH') != 'aarch64':
+    sys.exit('runtime is not ARM64: ' + JBR)
+print('Studio', s_info['version'], '| IntelliJ', i_info['buildNumber'], '| runtime', a_jbr['JAVA_VERSION'],
+      a_jbr.get('JAVA_RUNTIME_VERSION', ''), '(--jbr)' if a.jbr else '(IntelliJ)')
 
 # 2. Start from Google's tree.
 if os.path.exists(a.out):
@@ -84,7 +94,7 @@ def put(src, dst, need_arm64=True):
 
 # 3. Java runtime.
 shutil.rmtree(os.path.join(O, 'jbr'))
-shutil.copytree(os.path.join(I, 'jbr'), os.path.join(O, 'jbr'))
+shutil.copytree(JBR, os.path.join(O, 'jbr'))
 
 # 4. Launcher helpers.
 for f in ('WinProcessListHelper.exe', 'WinShellIntegrationBridge.dll', 'elevator.exe', 'fsnotifier.exe',
@@ -188,10 +198,30 @@ src.close()
 os.replace(tmp, jar)
 print('About label:', xml[start - 6:xml.index('"', start) + 1])
 
+# 7b. Studio's "Emulator Preview (qemu-next)" (Rabbit 3 and later, on in preview channels) launches
+# API 37+ phones from the SDK package emulators;latest, which is Google's x64 engine, instead of
+# the emulator package this distribution installs. Turn it off. Studio reads flag overrides from
+# system properties named by flag id; product-info.json is used on every launch, unlike the
+# .vmoptions file, which a user's own copy replaces.
+FLAGS_OFF = ('device.manager.emulator.preview.enabled', 'device.manager.emulator.preview.required')
+pinfo = os.path.join(O, 'product-info.json')
+with open(pinfo, encoding='utf8') as f:
+    pdata = json.load(f)
+for launch in pdata.get('launch', []):
+    args = launch.setdefault('additionalJvmArguments', [])
+    for flag in FLAGS_OFF:
+        args[:] = [x for x in args if not x.startswith('-D' + flag + '=')] + ['-D' + flag + '=false']
+with open(pinfo, 'w', encoding='utf8') as f:
+    json.dump(pdata, f, indent=2)
+print('flags off:', ', '.join(FLAGS_OFF))
+
 # 8. Nothing that loads into the IDE process may be x64 unless listed here as unavailable.
 UNAVAILABLE = {  # no ARM64 build exists; the feature is missing, as in earlier releases
     'plugins/android/resources/native/image_converter.dll',
     'plugins/android/resources/native/jni_object_tagger.dll',
+    # Rabbit 3: Studio's font sanitizer (OpenType Sanitizer). Without it, font downloads and the
+    # font editor report that the sanitizer is unavailable.
+    'plugins/android/resources/native/ots_jni.dll',
     'plugins/android/resources/native/video_decoder.dll',
     'plugins/android/resources/simpleperf/windows-x86_64/libsimpleperf_report.dll',
     'plugins/webp/lib/libwebp/win/webp_jni.dll',
