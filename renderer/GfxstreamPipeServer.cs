@@ -536,7 +536,22 @@ class GfxstreamPipeServer {
                 "posts " + statPosts + " frames " + statFrames + " pipelined " + statPipelined + " pipeline " + (capturePipeline ? 1 : 0) + " reads " + statReads + " same " + statSame + " readMs " + (statReadTicks * 1000 / System.Diagnostics.Stopwatch.Frequency) + "\n");
         } catch (Exception) { }
     }
+    // Until the bridge installs a foldable's display layout (on its first boot), Android keeps
+    // both screens on, and showing whichever drew last flipped the window between them. The
+    // inner screen wins; the cover screen is shown once the inner one has stopped drawing.
+    const int CoverTakeoverMs = 250;
+    static long lastInnerPostStamp = 0;
     static void NoteDisplayPost(int cb) {
+        long now = System.Diagnostics.Stopwatch.GetTimestamp();
+        int[] pd;
+        bool cover = coverW > 0 && !(coverW == lcdWidth && coverH == lcdHeight)
+            && cbDims.TryGetValue(cb, out pd) && pd[0] == coverW && pd[1] == coverH;
+        if (!cover) {
+            lastInnerPostStamp = now;
+        } else if (lastInnerPostStamp != 0
+                   && (now - lastInnerPostStamp) * 1000 / System.Diagnostics.Stopwatch.Frequency < CoverTakeoverMs) {
+            return;
+        }
         if (cb != activeDisplayCb) {
             if (activeDisplayCb > 0) { prevDisplayCb = activeDisplayCb; prevPostSeq = frameDirtyCounter; }
             Interlocked.Increment(ref statPosts);
