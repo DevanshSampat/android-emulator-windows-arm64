@@ -27,7 +27,7 @@ All replacement code lives in one cave appended to the R-X PT_LOAD; stock
 functions are never overwritten, only `bl` targets change.
 
 Usage:
-    python gfx_autopatch.py <stock_root> <out_root>
+    python gfx_autopatch.py <stock_root> <out_root> [--legacy-pipes]
         Walks <stock_root> recursively, patches every ELF that contains the
         signature and writes it to the same relative path under <out_root>.
         Writes <out_root>/manifest.txt listing patched relative paths.
@@ -201,6 +201,11 @@ def patch_bytes(data):
             nops += cbzs + [p]          # keep w0 = strcmp(name, "refcount")
             retarget.append((p + 8, "pipe_open"))
             notes.append(f"pipe->@whpx_pipe site=0x{p:x}")
+    if LEGACY_PIPES and not retarget:
+        legacy = find_legacy_pipe_sites(data)
+        if legacy:
+            retarget += legacy
+            notes.append(f"legacy pipe open->@whpx_pipe sites={len(legacy)}")
     gas = find_address_space_sites(data)
     if gas:
         retarget += gas
@@ -536,8 +541,12 @@ def _imm(tok):
     return int(tok, 0)
 
 
-def find_gas_call_sites(data):
-    """Return (open_sites, ioctl_sites) as lists of vaddrs of `bl` instructions."""
+def find_gas_call_sites(data, paths=None):
+    """Return (open_sites, ioctl_sites) as lists of vaddrs of `bl` instructions.
+    open_sites are open() calls whose x0 is one of `paths` (default: the
+    address-space device)."""
+    track_moves = paths is not None  # legacy pipes only: keeps modern results unchanged
+    paths = paths or (GAS_PATH,)
     try:
         import capstone
     except ImportError:
@@ -551,12 +560,13 @@ def find_gas_call_sites(data):
     secs = _sections(data)
     loads = [p for p in _phdrs(data) if p["type"] == 1]
     path_vas = set()
-    p = data.find(GAS_PATH)
-    while p >= 0:
-        va = _off2va(loads, p)
-        if va is not None:
-            path_vas.add(va)
-        p = data.find(GAS_PATH, p + 1)
+    for path in paths:
+        p = data.find(path)
+        while p >= 0:
+            va = _off2va(loads, p)
+            if va is not None:
+                path_vas.add(va)
+            p = data.find(path, p + 1)
     if not path_vas:
         return [], []
     plt = _plt_targets(data, secs, md, loads)
@@ -600,7 +610,16 @@ def find_gas_call_sites(data):
             d = _reg(ops[0]) if ops else None
             handled = False
             try:
-                if d and m in ("mov", "movz", "movn") and len(ops) == 2 and ops[1].startswith("#"):
+                if track_moves and d and m == "mov" and len(ops) == 2 and _reg(ops[1]):
+                    # Legacy pipe clients keep the path in a callee-saved register
+                    # across a TEMP_FAILURE_RETRY loop: mov x0, x21 ; bl open.
+                    n = _reg(ops[1])
+                    if n[0] in regs:
+                        regs[d[0]] = regs[n[0]]
+                    else:
+                        regs.pop(d[0], None)
+                    handled = True
+                elif d and m in ("mov", "movz", "movn") and len(ops) == 2 and ops[1].startswith("#"):
                     v = _imm(ops[1])
                     regs[d[0]] = v & ((1 << d[1]) - 1)
                     handled = True
@@ -744,6 +763,39 @@ def find_address_space_sites(data):
     return [(va, "gas_open") for va in open_sites] + [(va, "gas_ioctl") for va in ioctl_sites]
 
 
+# ---------------------------------------------------------------------------
+# Android 8 to 9 (legacy pipes, --legacy-pipes).
+#
+# These images have no vsock fallback to find: qemu_pipe.h is inlined into
+# every client and simply opens /dev/qemu_pipe (or /dev/goldfish_pipe), then
+# writes "pipe:<name>" and a NUL itself. So each such open() is retargeted to
+# pipe_open, which returns a connected @whpx_pipe socket: the stream that
+# follows is the same as on the device. At these call sites w0 is the path
+# pointer (non-zero), which pipe_open reads as "not refcount".
+# ---------------------------------------------------------------------------
+LEGACY_PIPE_PATHS = (b"/dev/qemu_pipe" + bytes(1), b"/dev/goldfish_pipe" + bytes(1))
+LEGACY_PIPES = False
+# Left unpatched, so they cannot reach the host. The sensors HAL then lists no sensors.
+# Patched, it got the host's one-sensor list and polled a channel that never sends
+# events; the failed poll aborts SensorService, which takes system_server down with it.
+LEGACY_SKIP = ("sensors.", "fingerprint.", "libreference-ril.")  # no modem on the host either
+# Replaced by an empty file (the overlay's "disabled"). keystore.ranchu is a Trusty
+# keymaster that needs a secure-world service on the host; without the module, the
+# keymaster HAL falls back to its software keymaster, and keystore comes up.
+LEGACY_EMPTY = ("keystore.",)
+
+
+def find_legacy_pipe_sites(data):
+    if not any(data.find(p) >= 0 for p in LEGACY_PIPE_PATHS):
+        return []
+    try:
+        open_sites, _ = find_gas_call_sites(data, LEGACY_PIPE_PATHS)
+    except RuntimeError as e:
+        print(f"[gfx_autopatch] WARNING: {e}")
+        return []
+    return [(va, "pipe_open") for va in open_sites]
+
+
 def print_blob(path):
     blob = open(path, "rb").read()
     h = blob.hex()
@@ -757,6 +809,10 @@ def main():
     if len(sys.argv) == 3 and sys.argv[1] == "--blob":
         print_blob(sys.argv[2])
         return 0
+    global LEGACY_PIPES
+    if "--legacy-pipes" in sys.argv:
+        sys.argv.remove("--legacy-pipes")
+        LEGACY_PIPES = True
     if len(sys.argv) != 3:
         print(__doc__)
         return 2
@@ -770,7 +826,12 @@ def main():
                 data = f.read()
             if data[:4] != b"\x7fELF":
                 continue
-            out, msg = patch_bytes(data)
+            if LEGACY_PIPES and fn.startswith(LEGACY_SKIP):
+                out, msg = None, "left unpatched (legacy)"
+            elif LEGACY_PIPES and fn.startswith(LEGACY_EMPTY):
+                out, msg = b"", "disabled (legacy)"
+            else:
+                out, msg = patch_bytes(data)
             print(f"[gfx_autopatch] {rel}: {msg}")
             if out is None:
                 continue

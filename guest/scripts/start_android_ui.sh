@@ -4,6 +4,11 @@
 # ----------------------------------------------------
 # 1. Bring up network FIRST before any graphics attempt
 # ----------------------------------------------------
+# Android 8 to 11 images (before Android 12; 8 and 9 also have this marker in the ramdisk root,
+# see prepare_whpx_initrd.py) keep their own graphics stack, already patched by whpx_init: no
+# modern shims, no graphics or HAL restarts.
+LEGACY=0
+{ [ -f /whpx_legacy_mount ] || [ "$(getprop ro.build.version.sdk)" -lt 31 ]; } 2>/dev/null && LEGACY=1
 ifconfig lo 127.0.0.1 up 2>/dev/null
 ip link set lo up 2>/dev/null
 ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up 2>/dev/null
@@ -87,7 +92,7 @@ if [ ! -f /dev/whpx_shims_mounted ]; then
   # Legacy fixed-offset graphics shims. Skipped when whpx_init already
   # overlaid this image's own auto-patched vendor binaries at boot (before any
   # HAL started); re-mounting or restarting the stack then only breaks it.
-  if [ ! -f /dev/whpx_gfxshim_mounted ]; then
+  if [ "$LEGACY" = 0 ] && [ ! -f /dev/whpx_gfxshim_mounted ]; then
     # Mount patched graphics and sensor shims
     if [ -d /data/local/tmp/patched/patched ]; then
       cp -f /data/local/tmp/patched/patched/* /data/local/tmp/patched/ 2>/dev/null
@@ -161,13 +166,14 @@ if [ ! -f /dev/whpx_shims_mounted ]; then
   umount /vendor/etc/permissions/android.hardware.bluetooth.xml 2>/dev/null
   umount /vendor/etc/permissions/android.hardware.bluetooth_le.xml 2>/dev/null
   umount /vendor/etc/permissions/android.hardware.uwb.xml 2>/dev/null
-  umount /vendor/etc/permissions/handheld_core_hardware.xml 2>/dev/null
+  # Legacy images get their own handheld_core_hardware.xml (without ethernet) from whpx_init.
+  [ "$LEGACY" = 0 ] && umount /vendor/etc/permissions/handheld_core_hardware.xml 2>/dev/null
   if [ -f /data/local/tmp/empty_perm.xml ]; then
     mount -o bind /data/local/tmp/empty_perm.xml /vendor/etc/permissions/android.hardware.bluetooth.xml 2>/dev/null
     mount -o bind /data/local/tmp/empty_perm.xml /vendor/etc/permissions/android.hardware.bluetooth_le.xml 2>/dev/null
     mount -o bind /data/local/tmp/empty_perm.xml /vendor/etc/permissions/android.hardware.uwb.xml 2>/dev/null
   fi
-  if [ -f /data/local/tmp/handheld_core_hardware.xml ]; then
+  if [ "$LEGACY" = 0 ] && [ -f /data/local/tmp/handheld_core_hardware.xml ]; then
     mount -o bind /data/local/tmp/handheld_core_hardware.xml /vendor/etc/permissions/handheld_core_hardware.xml 2>/dev/null
   fi
   setprop ro.radio.noril yes
@@ -177,10 +183,13 @@ if [ ! -f /dev/whpx_shims_mounted ]; then
   chcon u:object_r:vendor_configs_file:s0 /dev/whpx_empty_hals.conf 2>/dev/null
   mount -o bind /dev/whpx_empty_hals.conf /vendor/etc/sensors/hals.conf 2>/dev/null
   setprop ctl.start vendor.sensors-hal-2-1-multihal 2>/dev/null
-  setprop pm.dexopt.first-boot skip
-  setprop pm.dexopt.boot-after-ota skip
-  setprop pm.dexopt.boot-after-mainline-update skip
-  setprop pm.dexopt.install skip
+  # "skip" is not a valid filter before Android 10: PackageManager then stops system_server.
+  if [ "$LEGACY" = 0 ]; then
+    setprop pm.dexopt.first-boot skip
+    setprop pm.dexopt.boot-after-ota skip
+    setprop pm.dexopt.boot-after-mainline-update skip
+    setprop pm.dexopt.install skip
+  fi
 
   cmd window set-fix-to-user-rotation enabled 2>/dev/null
   cmd window user-rotation lock 0 2>/dev/null
@@ -192,7 +201,7 @@ if [ ! -f /dev/whpx_shims_mounted ]; then
   sync
 
   # Restart allocator, composer3, and health HALs in proper dependency order
-  if [ ! -f /dev/whpx_gfxshim_mounted ]; then
+  if [ "$LEGACY" = 0 ] && [ ! -f /dev/whpx_gfxshim_mounted ]; then
     chmod 755 /dev/whpx_libs /dev/whpx_libs/allocator.ranchu /vendor/bin/hw/android.hardware.graphics.allocator-service.ranchu 2>/dev/null
     chmod 644 /dev/whpx_libs/*.so 2>/dev/null
     pkill -9 -f composer3 2>/dev/null
@@ -205,10 +214,13 @@ if [ ! -f /dev/whpx_shims_mounted ]; then
     setprop ctl.start vendor.hwcomposer-3 2>/dev/null
     setprop ctl.start vendor.hwcomposer-2-4 2>/dev/null
   fi
-  killall -9 android.hardware.health-service.default android.hardware.health-service android.hardware.health-service.example android.hardware.health@2.1-service 2>/dev/null
-  setprop ctl.restart vendor.health-default 2>/dev/null
-  setprop ctl.restart health-hal-2-1 2>/dev/null
-  setprop ctl.start health-hal-2-1 2>/dev/null
+  # Not on legacy images: on Android 11 BatteryService crashed system_server when its health HAL was killed.
+  if [ "$LEGACY" = 0 ]; then
+    killall -9 android.hardware.health-service.default android.hardware.health-service android.hardware.health-service.example android.hardware.health@2.1-service 2>/dev/null
+    setprop ctl.restart vendor.health-default 2>/dev/null
+    setprop ctl.restart health-hal-2-1 2>/dev/null
+    setprop ctl.start health-hal-2-1 2>/dev/null
+  fi
 
   # Surfaceflinger & display config
   setprop debug.sf.nobootanimation 0
@@ -230,7 +242,7 @@ fi
 # ----------------------------------------------------
 # 4. Guarantee graphics stack is active
 # ----------------------------------------------------
-if ! pidof surfaceflinger >/dev/null; then
+if [ "$LEGACY" = 0 ] && ! pidof surfaceflinger >/dev/null; then
   pkill -9 -f composer3 2>/dev/null
   pkill -9 -f composer@2.4 2>/dev/null
   pkill -9 surfaceflinger 2>/dev/null

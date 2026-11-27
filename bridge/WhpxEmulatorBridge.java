@@ -391,6 +391,58 @@ public class WhpxEmulatorBridge {
      * modules, QEMU's Hyper-V enlightenments and "whpx_stimer" on the command line.
      * WHPX_TIMER=arch goes back to the stock kernel and the architected timer.
      */
+    /**
+     * Android 8 to 9 images ship one gzip ramdisk with the whole root filesystem (newer ones
+     * use LZ4 and a first-stage init). prepare_whpx_initrd.py builds those with an early
+     * mount done by whpx_init, and their init reads androidboot.* only from the kernel
+     * command line, not from bootconfig.
+     */
+    private static boolean isLegacyImage(String sysDir) {
+        try (java.io.InputStream in = Files.newInputStream(Paths.get(sysDir, "ramdisk.img"))) {
+            return in.read() == 0x1f && in.read() == 0x8b;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** Extra kernel command line for legacy images; empty for others. */
+    private static volatile String legacyCmdline = "";
+
+    /**
+     * The bootconfig settings as kernel parameters, for init on legacy images, plus
+     * qemu.gles=1 (ro.kernel.qemu.gles), which makes their EGL loader pick the emulation
+     * driver. The adb key is left out (it is in the ramdisk) to stay within the
+     * kernel's 2048-byte command line.
+     */
+    private static String legacyCmdline(String bootconfig) {
+        // Not printk.devkmsg=on (useful when init dies early): it sends every kmsg write to the
+        // serial console unthrottled, which slowed Android 8.1 into watchdog restarts.
+        // qemu.uirenderer=skiagl: Android 9's vendor init.ranchu.rc sets debug.hwui.renderer from
+        // it (otherwise "opengl"). That old pipeline waits on ~130 host round trips (glGetError)
+        // per frame over this GL transport: 150 ms frames, against 5 ms with Skia.
+        StringBuilder sb = new StringBuilder(" qemu.gles=1 qemu.opengles.version=131072 qemu.uirenderer=skiagl");
+        // What init needs first (verified boot on Android 10-11, the display, our helpers);
+        // the rest while it fits.
+        String[] first = { "androidboot.vbmeta.", "androidboot.veritymode", "androidboot.verifiedbootstate",
+            "androidboot.lcd_density", "androidboot.whpx.", "androidboot.qemu.hw.mainkeys", "androidboot.hardware" };
+        for (int pass = 0; pass < 2; pass++) {
+            for (String line : bootconfig.split("\n")) {
+                int eq = line.indexOf('=');
+                if (eq <= 0) continue;
+                String key = line.substring(0, eq).trim();
+                String val = line.substring(eq + 1).trim().replace("\"", "");
+                if (!key.startsWith("androidboot.") || key.contains("adb.pubkey") || val.isEmpty() || val.contains(" ")) continue;
+                boolean isFirst = false;
+                for (String f : first) isFirst |= key.startsWith(f);
+                if (isFirst != (pass == 0) || sb.indexOf(" " + key + "=") >= 0) continue;
+                if (sb.length() + key.length() + val.length() + 2 > 1300) continue;
+                sb.append(' ').append(key).append('=').append(val);
+            }
+        }
+        System.out.println("[WhpxEmulatorBridge] Android 8-9 image: " + sb.length() + " bytes of bootconfig on the kernel command line");
+        return sb.toString();
+    }
+
     private static boolean useStimerKernel(int apiNum) {
         if (apiNum < 34 || "arch".equalsIgnoreCase(System.getenv("WHPX_TIMER"))) return false;
         return Files.exists(Paths.get(bridgeDir, "kernel_whpx_stimer"))
@@ -1343,8 +1395,14 @@ public class WhpxEmulatorBridge {
         boolean stimer = useStimerKernel(apiNum);
         Path universalKernel = Paths.get(bridgeDir, stimer ? "kernel_whpx_stimer" : "kernel_whpx_universal");
         Path p7Kernel = Paths.get(bridgeDir, "kernel_p7_permissive");
+        // The same kernel, with its vDSO's DT_AARCH64_BTI_PLT tag rewritten to DT_DEBUG. Android 8
+        // to 11 linkers don't know the tag and print a warning in every process; it lands in
+        // adb shell output, and Android Studio's installer then fails ("Expecting MAGIC_NUMBER").
+        Path legacyKernel = Paths.get(bridgeDir, "kernel_p7_legacy");
         String kernelPath;
-        if (apiNum >= 34 && Files.exists(universalKernel)) {
+        if (apiNum < 31 && isLegacyImage(sysDir) && Files.exists(legacyKernel)) {
+            kernelPath = legacyKernel.toString();
+        } else if (apiNum >= 34 && Files.exists(universalKernel)) {
             kernelPath = universalKernel.toString();
         } else if (Files.exists(p7Kernel)) {
             kernelPath = p7Kernel.toString();
@@ -1490,7 +1548,7 @@ public class WhpxEmulatorBridge {
 
 
 
-            "-append", "console=ttyAMA0,38400 earlyprintk=ttyAMA0 audit=0 loglevel=7 androidboot.hardware=ranchu " + "androidboot.serialno=" + getSerialPrefix(sysDir) + " androidboot.boot_devices=3f000000.pcie androidboot.selinux=permissive androidboot.console=ttyAMA0 androidboot.verifiedbootstate=orange androidboot.flash.locked=0 androidboot.service.adb.tcp.port=5555 androidboot.radio.noril=yes androidboot.vendor.radio.noril=1 qemu=1 no_timer_check rcupdate.rcu_cpu_stall_timeout=60 bootconfig" + (stimer ? " whpx_stimer" : "")
+            "-append", "console=ttyAMA0,38400 earlyprintk=ttyAMA0 audit=0 loglevel=7 androidboot.hardware=ranchu " + "androidboot.serialno=" + getSerialPrefix(sysDir) + " androidboot.boot_devices=3f000000.pcie androidboot.selinux=permissive androidboot.console=ttyAMA0 androidboot.verifiedbootstate=orange androidboot.flash.locked=0 androidboot.service.adb.tcp.port=5555 androidboot.radio.noril=yes androidboot.vendor.radio.noril=1 qemu=1 no_timer_check rcupdate.rcu_cpu_stall_timeout=60 bootconfig" + (stimer ? " whpx_stimer" : "") + legacyCmdline
 
 
 
@@ -2356,6 +2414,21 @@ public class WhpxEmulatorBridge {
                         System.out.println("[WhpxEmulatorBridge] Guest bringup confirmed after " + i + " check(s)");
                         return;
                     }
+                    // adb never reached the guest (seen once on Android 11 after the bringup's
+                    // adb root: adbd running but nothing on tcp:5555, so no input daemon and no
+                    // touch). The serial console still has a root shell: record adbd's state in
+                    // the log and restart it, twice at most.
+                    if (i == 6 || i == 20) {
+                        Process st = new ProcessBuilder(adbExe, "-s", emulatorSerial, "get-state").redirectErrorStream(true).start();
+                        String state = new String(st.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+                        st.waitFor(5, TimeUnit.SECONDS);
+                        if (!state.startsWith("device")) {
+                            System.out.println("[WhpxEmulatorBridge] adb state '" + state + "': restarting adbd over the serial console");
+                            sendSerialSlow("\r\necho WHPXDIAG adbd=$(getprop init.svc.adbd) pid=$(pidof adbd) port=$(getprop service.adb.tcp.port) root=$(getprop service.adb.root); "
+                                + "(netstat -ltn 2>/dev/null || cat /proc/net/tcp /proc/net/tcp6) | grep -iE ':5555|:15B3' | head -4\r\n");
+                            sendSerialSlow("setprop service.adb.tcp.port 5555; setprop ctl.restart adbd\r\n");
+                        }
+                    }
                 } catch (Exception ignored) {}
             }
             System.out.println("[WhpxEmulatorBridge] Guest bringup was never confirmed");
@@ -2579,6 +2652,9 @@ public class WhpxEmulatorBridge {
                 // Through the time zone service, so the clock in the status bar is told. Setting
                 // persist.sys.timezone directly first made the service see no change: it kept GMT.
                 "cmd time_zone_detector suggest_manual_time_zone --zone_id " + hostTimeZone() + " || cmd alarm set-timezone " + hostTimeZone() + "; " +
+                // Android 8 to 11 have neither command: IAlarmManager.setTimeZone is transaction 3.
+                // It ignores a zone equal to persist.sys.timezone (already set), so go through GMT.
+                "[ \"$(getprop ro.build.version.sdk)\" -lt 31 ] && { service call alarm 3 s16 GMT; service call alarm 3 s16 " + hostTimeZone() + "; } >/dev/null; " +
 
 
 
@@ -3808,6 +3884,25 @@ public class WhpxEmulatorBridge {
                 Files.deleteIfExists(rawTmp);
                 if (Files.exists(sysUserdata) && Files.size(sysUserdata) >= 50_000_000L && hasFilesystem(sysUserdata)) {
                     Files.copy(sysUserdata, rawTmp, StandardCopyOption.REPLACE_EXISTING);
+                    // Android 8 to 11 images ship a ~600 MB /data that nothing grows in the guest
+                    // (newer ones are resized there), so a large app failed with
+                    // INSUFFICIENT_STORAGE. Online resize in the guest stops at ~620 MB.
+                    if (isLegacyImage(sysDir) && Files.size(rawTmp) < 10_000_000_000L) {
+                        Path bin64 = Paths.get(sdkDir, "emulator", "bin64");
+                        Path e2fsck = bin64.resolve("e2fsck.exe"), resize2fs = bin64.resolve("resize2fs.exe");
+                        if (Files.exists(e2fsck) && Files.exists(resize2fs)) {
+                            try {
+                                // e2fsck exits 1 when it corrected something; resize2fs requires a fresh check.
+                                Process fsck = new ProcessBuilder(e2fsck.toString(), "-fy", rawTmp.toString())
+                                    .redirectErrorStream(true).redirectOutput(ProcessBuilder.Redirect.DISCARD).start();
+                                fsck.waitFor(300, TimeUnit.SECONDS);
+                                runTool("resize2fs", 600, resize2fs.toString(), rawTmp.toString(), "10240M");
+                                System.out.println("[WhpxEmulatorBridge] /data grown to 10 GB for this Android 8-11 image");
+                            } catch (Exception e) {
+                                System.out.println("[WhpxEmulatorBridge] could not grow /data (" + e.getMessage() + "); it stays at the image's size");
+                            }
+                        }
+                    }
                 } else {
                     runTool("mke2fs", 600, mke2fsExe, "-F", "-t", "ext4", "-O", "^orphan_file", "-b", blockSize, rawTmp.toString(), "10240M");
                 }
@@ -4170,6 +4265,7 @@ public class WhpxEmulatorBridge {
 
 
 
+        legacyCmdline = isLegacyImage(sysDir) ? legacyCmdline(bc.toString()) : "";
         byte[] paramBytes = bc.toString().getBytes(StandardCharsets.UTF_8);
 
 
