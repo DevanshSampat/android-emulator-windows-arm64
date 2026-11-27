@@ -98,8 +98,12 @@ while true; do
     settings put global bluetooth_on 0 2>/dev/null
     cmd bluetooth_manager disable >/dev/null 2>&1 || svc bluetooth disable >/dev/null 2>&1
   fi
-  cmd netpolicy set restrict-background false 2>/dev/null
-  ndc bandwidth setglobalalert 10737418240 2>/dev/null
+  # Android 8 to 11: not while NetworkPolicyManagerService initialises. Calls every 2 s
+  # then kept it from finishing within 30 s, and system_server stopped ("init timeout").
+  if [ "$(getprop ro.build.version.sdk)" -ge 31 ] 2>/dev/null || [ "$(getprop sys.boot_completed)" = 1 ]; then
+    cmd netpolicy set restrict-background false 2>/dev/null
+    ndc bandwidth setglobalalert 10737418240 2>/dev/null
+  fi
   fi
 
   # 5. Ensure DefaultNetworkAgent is running
@@ -206,6 +210,10 @@ while true; do
       # hid real failures and the latter deadlocked later boots.
       if [ ! -f /dev/whpx_boot_done ] && [ "$(getprop sys.boot_completed)" = 1 ]; then
         wm dismiss-keyguard 2>/dev/null
+        # Android 8 to 9 hand the kernel a time zone as system_server starts. The first such
+        # call shifts the clock by the zone offset on these kernels (RTC taken as local
+        # time), so set it back from the RTC, which is UTC. Later calls do not shift it.
+        [ "$(getprop ro.build.version.sdk)" -lt 31 ] 2>/dev/null && hwclock -s -u 2>/dev/null
 
 
         touch /dev/whpx_boot_done 2>/dev/null

@@ -14,7 +14,7 @@ Stock ARM64 system images boot with no per-image patching. The bridge adapts the
 
 | Form factor | Tested on |
 |---|---|
-| Phone | Android 13, 14, 16 and 17 (Pixel 7, 8a, 9a, 10 Pro) |
+| Phone | Android 8.0, 8.1, 9, 10, 11, 12, 13, 14, 16 and 17 (Pixel 2, 7, 8a, 9a, 10 Pro) |
 | TV | Android 12 and 14 (720p, 4K) |
 | Wear OS | Android 17 |
 
@@ -25,6 +25,12 @@ Controls, and guest vsync that follows the host monitor's refresh rate.
 
 - Google publishes no ARM64 TV images for API 28 to 30 or API 35, so those cannot run.
 - There is no audio device yet.
+- Android 8 to 11: sensors and fingerprint are off. On Android 8.1, startup waits 30 s on
+  NetworkPolicy (the kernel has no `xt_qtaguid`, and 8.1 then never signals its init). On
+  Android 9 and 10, shared storage (`/sdcard`) is one directory open to every app, because the
+  kernel has no sdcardfs. The Android 8 to 10 images ship Google Play services from 2020, too
+  old for current Google sign-in; Google publishes no ARM64 Play Store image for Android 8.
+- A device switched to a different system image needs its data wiped first.
 - Video uses software decoders in the guest, so high resolutions depend on the host CPU.
 - The 4K TV AVD renders at about 14 fps.
 - Scrolling on a phone AVD shows about 116 to 118 distinct frames per second on a 120 Hz monitor

@@ -1190,6 +1190,37 @@ class GfxstreamPipeServer {
         if (CapDiag.TryAdd("readpixels", true)) Console.WriteLine("[PIPE] bulk glReadPixels op=" + op + " " + w + "x" + h + " size=" + size);
     }
 
+    // glMapBufferRangeAEMU: older GLES encoders (Android 8 to 11) map a buffer for reading
+    // by copying its contents back: [op, len=28, target, offset, length, access,
+    // __size_mapped], then `length` bytes come back. Through the byte path a large buffer
+    // took seconds, and every app drawing in that time stalled (SystemUI and launcher
+    // ANRs). Newer encoders map through DMA and never send this. GLintptr/GLsizeiptr are
+    // 32-bit in this protocol. Only the write's last packet is checked, as above.
+    static void NoteGlMapBufferRead(uint ctxId, byte[] buf, int len) {
+        const int Pkt = 28;
+        const int MinBulk = 4096;
+        const int OpGlMapBufferRangeAEMU = 2263;  // stable GLES opcode; seen from Android 8.1
+        if (len < Pkt) return;
+        int off = len - Pkt;
+        int op = BitConverter.ToInt32(buf, off);
+        if (op != OpGlMapBufferRangeAEMU || BitConverter.ToInt32(buf, off + 4) != Pkt) return;
+        int target = BitConverter.ToInt32(buf, off + 8);
+        int length = BitConverter.ToInt32(buf, off + 16);
+        int access = BitConverter.ToInt32(buf, off + 20);
+        int size = BitConverter.ToInt32(buf, off + 24);
+        switch (target) {
+            case 0x8892: case 0x8893: case 0x8A11: case 0x88EB: case 0x88EC:  // array, element, uniform, pixel pack/unpack
+            case 0x8F36: case 0x8F37: case 0x8C8E: case 0x90D2: case 0x8F3F:  // copy read/write, xfb, SSBO, draw indirect
+                break;
+            default:
+                return;
+        }
+        // The encoder reads back for GL_MAP_READ_BIT and for writes that don't invalidate.
+        if ((access & ~0xFF) != 0 || length != size || size < MinBulk || size > (64 << 20)) return;
+        ctxPendingBulk[ctxId] = size;
+        if (CapDiag.TryAdd("mapbuffer" + op, true)) Console.WriteLine("[PIPE] bulk glMapBufferRangeAEMU op=" + op + " size=" + size + " access=0x" + access.ToString("x"));
+    }
+
     static ConcurrentDictionary<int, bool> SeenOps = new ConcurrentDictionary<int, bool>();
     // ctx -> pixel bytes the renderer will return for an rcReadColorBuffer in flight.
     static ConcurrentDictionary<uint, int> ctxPendingBulk = new ConcurrentDictionary<uint, int>();
@@ -1645,6 +1676,7 @@ class GfxstreamPipeServer {
                             if (pc != null) t1 = Perf.Now();
                             InspectOpcodes(id, wbytes, n);
                             NoteGlReadPixels(id, wbytes, n);
+                            NoteGlMapBufferRead(id, wbytes, n);
                             Marshal.Copy(wbytes, 0, buf, n);
                             stream_renderer_box wbox = new stream_renderer_box { x = 0, y = 0, z = 0, w = (uint)n, h = 1, d = 1 };
                             if (pc != null) { t2 = Perf.Now(); Perf.BeforeSend(pc, t2); }

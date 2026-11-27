@@ -318,7 +318,35 @@ static void apply_early_props(void) {
             if (p && (p[strlen(key)] == '0' || p[strlen(key)] == '1')) keys[0] = p[strlen(key)];
         }
     }
+    /* The device density, from bootconfig (androidboot.lcd_density = "420") or, on Android 8
+     * to 11, the kernel command line (androidboot.lcd_density=420). zygote reads
+     * ro.sf.lcd_density once as it starts and gives every app that density; set too late
+     * (apply_boot_density's single try fails while the runtime APEX is not mounted), apps ran
+     * in 213 dpi compatibility mode under a 420 dpi system UI (seen on Android 12). */
+    char density[8] = { 0 };
+    {
+        const char* srcs[2][2] = { { "/proc/bootconfig", "androidboot.lcd_density = \"" },
+                                   { "/proc/cmdline", "androidboot.lcd_density=" } };
+        for (int s = 0; s < 2 && !density[0]; s++) {
+            int dfd = open(srcs[s][0], O_RDONLY | O_CLOEXEC);
+            if (dfd < 0) continue;
+            int n = read(dfd, buf, sizeof(buf) - 1);
+            close(dfd);
+            if (n <= 0) continue;
+            buf[n] = 0;
+            char* p = strstr(buf, srcs[s][1]);
+            if (!p) continue;
+            p += strlen(srcs[s][1]);
+            int k = 0;
+            while (k < 5 && p[k] >= '0' && p[k] <= '9') { density[k] = p[k]; k++; }
+            density[k] = 0;
+        }
+    }
     if (fork() != 0) return;
+    if (density[0]) {
+        setprop_retry("ro.sf.lcd_density", density);
+        setprop_retry("qemu.sf.lcd_density", density);
+    }
     setprop_retry("ro.surface_flinger.max_frame_buffer_acquired_buffers", "3");
     if (keys[0]) setprop_retry("qemu.hw.mainkeys", keys);
     _exit(0);
@@ -963,6 +991,7 @@ static void host_gfx_port(char* out, size_t len) {
 static void start_gfx_forwarder(void) {
     if (!g_fwd) return;
     const char* path = "/dev/.whpx_gfx/gfx_forwarder";
+    mkdir("/dev/.whpx_gfx", 0755);
     int fd = stage_file(path, g_fwd, g_fwd_len, 0755);
     free(g_fwd);
     g_fwd = NULL;
@@ -1115,6 +1144,105 @@ static void boot_time_swappiness(void) {
     klog(msg);
 }
 
+/* The image's SDK level from /system/build.prop (getprop may not run this early), or 0. */
+static int system_sdk(void) {
+    size_t len = 0;
+    char* bp = read_all("/system/build.prop", &len);
+    if (!bp) return 0;
+    char* p = strstr(bp, "ro.build.version.sdk=");
+    int sdk = p ? atoi(p + strlen("ro.build.version.sdk=")) : 0;
+    free(bp);
+    return sdk;
+}
+
+/* The kernels offer binder only through binderfs. Android 12+ init mounts it itself;
+ * Android 8 and 9 get it from the ramdisk's init.ranchu.rc (prepare_whpx_initrd.py).
+ * Android 11's init.rc mounts it too. Android 10 reads no ramdisk rc after the switch to
+ * /system, so mount it here, in Android's namespace, before servicemanager starts (it
+ * exits without /dev/binder). */
+static void ensure_binder_devices(void) {
+    if (access("/dev/binder", F_OK) == 0) return;
+    // Android 8 and 9 (marker still at the root: no switch_root) mount it from their rc;
+    // a second instance mounted first left services on different binder contexts.
+    if (access("/whpx_legacy_mount", F_OK) == 0) return;
+    int sdk = system_sdk();
+    if (sdk == 0 || sdk >= 30) return;
+    mkdir("/dev/binderfs", 0755);
+    if (mount("binder", "/dev/binderfs", "binder", 0, "stats=global") != 0
+            && mount("binder", "/dev/binderfs", "binder", 0, NULL) != 0) {
+        klog("binderfs mount failed");
+        return;
+    }
+    chmod("/dev/binderfs", 0755);
+    static const char* const names[] = { "binder", "hwbinder", "vndbinder" };
+    for (int i = 0; i < 3; i++) {
+        char src[64], dst[64];
+        snprintf(src, sizeof(src), "/dev/binderfs/%s", names[i]);
+        snprintf(dst, sizeof(dst), "/dev/%s", names[i]);
+        chmod(src, 0666);
+        symlink(src, dst);
+    }
+    klog("binderfs mounted, /dev/binder, /dev/hwbinder, /dev/vndbinder linked");
+}
+
+/* Android 10 and 11 route media through Codec2, whose linear buffers come from ION;
+ * these kernels have none, and every codec start crashed its caller (system_server,
+ * SystemUI: Android 11's SoundPool decodes the UI sounds this way). Android 10 still has
+ * its OMX path: turn Codec2 off. Android 11 takes linear buffers from gralloc instead
+ * (pool mask: BLOB 1<<19 | BUFFERQUEUE 1<<18). (Android 9 gets the first from the ramdisk
+ * rc.) All build.prop files are loaded before the property service starts, so this
+ * lands after the image's values. */
+static void legacy_media_props(void) {
+    int sdk = system_sdk();
+    if (sdk < 29 || sdk >= 31) return;
+    if (fork() != 0) return;
+    if (sdk == 29) setprop_retry("debug.stagefright.ccodec", "0");
+    else setprop_retry("debug.stagefright.c2-poolmask", "786432");
+    _exit(0);
+}
+
+/* Android 9 and 10 serve shared storage (/storage/emulated) through the sdcard daemon,
+ * which only works with the sdcardfs (or esdfs) kernel filesystem; these kernels have
+ * neither. The volume then stays "unmountable" and anything using shared storage fails
+ * (the Play Store said "free up space" with 9 GB free). This stand-in does what vold
+ * waits for: the source directory bind-mounted at /mnt/runtime/<view>/<label> for every
+ * view, then it exits, as sdcard does after mounting sdcardfs. sdcardfs's per-app permission
+ * derivation is not reproduced: the tree is opened to every app instead (an emulator). */
+static const char g_sdcard_shim[] =
+    "#!/system/bin/sh\n"
+    "# WHPX emulator stand-in for the sdcard daemon (no sdcardfs in this kernel).\n"
+    "src=\"\"; label=\"\"\n"
+    "for a in \"$@\"; do src=\"$label\"; label=\"$a\"; done\n"
+    "[ -d \"$src\" ] || exit 1\n"
+    "chmod 0777 \"$src\"\n"
+    "for d in \"$src\"/*; do [ -d \"$d\" ] && chmod -R a+rwX \"$d\"; done\n"
+    "for v in /mnt/runtime/*; do\n"
+    "  mkdir -p \"$v/$label\"\n"
+    "  mount -o bind \"$src\" \"$v/$label\"\n"
+    "done\n"
+    "# vold prepares each user's directory (root 0755) after this starts: keep it open for a\n"
+    "# while, in the background. Then exit, as sdcard does with sdcardfs: Android 10's vold\n"
+    "# waits for it to exit before the volume counts as mounted.\n"
+    "( i=0; while [ $i -lt 30 ]; do chmod 0777 \"$src\"/* 2>/dev/null; sleep 10; i=$((i + 1)); done ) </dev/null >/dev/null 2>&1 &\n"
+    "exit 0\n";
+
+static void legacy_sdcard_shim(void) {
+    int sdk = system_sdk();
+    if (sdk != 28 && sdk != 29) return;
+    const char* target = "/system/bin/sdcard";
+    if (access(target, F_OK) != 0) return;
+    mkdir("/dev/.whpx_gfx", 0755);
+    const char* staged = "/dev/.whpx_gfx/sdcard";
+    int fd = stage_file(staged, g_sdcard_shim, sizeof(g_sdcard_shim) - 1, 0755);
+    if (fd < 0) { klog("sdcard stand-in: staging failed"); return; }
+    char ctx[256];
+    ssize_t cl = lgetxattr(target, "security.selinux", ctx, sizeof(ctx));
+    if (cl > 0) fsetxattr(fd, "security.selinux", ctx, (size_t)cl, 0);
+    close(fd);
+    int rc = mount(staged, target, NULL, MS_BIND, NULL);
+    klog(rc == 0 ? "sdcard stand-in bound over /system/bin/sdcard (no sdcardfs)" : "sdcard stand-in bind failed");
+}
+
 static void run_supervisor(void) {
     // Mount proc and devtmpfs in daemon's early rootfs
     mkdir("/proc", 0755);
@@ -1185,13 +1313,18 @@ static void run_supervisor(void) {
     add_default_gateway("eth0", "10.0.2.2");
     start_route_keeper();
     mock_power_supply();
+    ensure_binder_devices();
+    legacy_media_props();
+    legacy_sdcard_shim();
+    // The forwarder first: a client of the patched libraries that starts between the two
+    // (SurfaceFlinger on Android 8) otherwise finds no @whpx_pipe and aborts once.
+    start_gfx_forwarder();
     apply_gfx_overlay();
     hide_radio_hal();
     empty_sensor_config();
     hide_ethernet_feature();
     hide_multidisplay();
     allow_pipe_syscalls();
-    start_gfx_forwarder();
     if (fork() == 0) {
         /* ueventd may not have created the node yet; do not hold up the supervisor. */
         for (int i = 0; i < 300 && access("/dev/block/zram0", F_OK) != 0; i++) usleep(100000);
@@ -1358,7 +1491,131 @@ static void run_supervisor(void) {
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * Android 8 to 9 (legacy) images: early mount done here.
+ *
+ * On those images init mounts /system and /vendor before it loads SELinux
+ * policy or parses any .rc file, from fstab entries that Google's emulator
+ * puts in the device tree. Our QEMU has no such entries, and modern
+ * first-stage init (which loads kernel modules) does not exist yet, so, as
+ * PID 1 before handing over to init: load the virtio modules, then mount
+ * what /fstab.ranchu.early lists. init then skips its own early mount
+ * ("missing fstab in device tree") and finds both trees in place.
+ * prepare_whpx_initrd.py adds /whpx_legacy_mount to such ramdisks only.
+ * ------------------------------------------------------------------------- */
+static void legacy_load_modules(void) {
+    size_t len = 0;
+    char* list = read_all("/lib/modules/modules.load", &len);
+    if (!list) return;
+    char* save = NULL;
+    for (char* name = strtok_r(list, "\n", &save); name; name = strtok_r(NULL, "\n", &save)) {
+        char path[256], msg[320];
+        snprintf(path, sizeof(path), "/lib/modules/%s", name);
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) continue;
+        long rc = syscall(273 /* finit_module */, fd, "", 0);
+        if (rc != 0 && errno != EEXIST) {
+            snprintf(msg, sizeof(msg), "legacy mount: insmod %s failed: %s", name, strerror(errno));
+            klog(msg);
+        }
+        close(fd);
+    }
+    free(list);
+}
+
+/* The kernels have no devtmpfs (Android's init builds /dev on tmpfs with
+ * ueventd), so the nodes needed here are made by hand from sysfs. Both
+ * mounts are detached again before init starts; init mounts its own. */
+/* system.img and vendor.img of these images are GPT disks with one partition
+ * (Google's emulator mounts its first partition), so the node made for `dev`
+ * is that partition when the disk has one. */
+static int legacy_blockdev(const char* dev) {
+    const char* name = strrchr(dev, '/');
+    if (!name) return -1;
+    char path[96], part[96], buf[32];
+    snprintf(path, sizeof(path), "/sys/block/%s/dev", name + 1);
+    snprintf(part, sizeof(part), "/sys/block/%s/%s1/dev", name + 1, name + 1);
+    for (int i = 0; i < 1000; i++) {
+        if (access(path, F_OK) == 0) {
+            usleep(20000);  /* the partition scan runs as the disk is added */
+            if (access(part, F_OK) == 0) snprintf(path, sizeof(path), "%s", part);
+        }
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            ssize_t n = read(fd, buf, sizeof(buf) - 1);
+            close(fd);
+            unsigned maj = 0, min = 0;
+            if (n > 0) { buf[n] = 0; if (sscanf(buf, "%u:%u", &maj, &min) == 2) {
+                if (mknod(dev, S_IFBLK | 0600, (maj << 8) | (min & 0xff) | ((min & ~0xffu) << 12)) == 0 || errno == EEXIST)
+                    return i * 10;
+            } }
+        }
+        usleep(10000);
+    }
+    return -1;
+}
+
+static void legacy_premount(void) {
+    mkdir("/dev", 0755);
+    mkdir("/sys", 0755);
+    if (mount("tmpfs", "/dev", "tmpfs", MS_NOSUID, "mode=0755") != 0) return;
+    mknod("/dev/kmsg", S_IFCHR | 0600, (1 << 8) | 11);
+    mkdir("/dev/block", 0755);
+    g_kmsg_fd = open("/dev/kmsg", O_WRONLY | O_CLOEXEC);
+    if (mount("sysfs", "/sys", "sysfs", 0, NULL) != 0) klog("legacy mount: sysfs failed");
+    legacy_load_modules();
+    size_t len = 0;
+    char* fstab = read_all("/fstab.ranchu.early", &len);
+    if (fstab) {
+        char* save = NULL;
+        for (char* line = strtok_r(fstab, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+            char dev[128], dir[64], type[16], msg[256];
+            if (line[0] == '#' || sscanf(line, "%127s %63s %15s", dev, dir, type) != 3) continue;
+            int waited = legacy_blockdev(dev);
+            mkdir(dir, 0755);
+            int rc = waited < 0 ? -1 : mount(dev, dir, type, MS_RDONLY, NULL);
+            /* Android 9: system.img is system-as-root (the root filesystem, with the system
+             * tree in system/). Keep it at /system_root and bind its system/ to /system. */
+            if (rc == 0 && strcmp(dir, "/system") == 0 && access("/system/build.prop", F_OK) != 0
+                    && access("/system/system/build.prop", F_OK) == 0) {
+                umount("/system");
+                mkdir("/system_root", 0755);
+                rc = mount(dev, "/system_root", type, MS_RDONLY, NULL);
+                if (rc == 0) rc = mount("/system_root/system", "/system", NULL, MS_BIND, NULL);
+                klog("legacy mount: system-as-root image, /system_root/system bound to /system");
+            }
+            snprintf(msg, sizeof(msg), "legacy mount: %s on %s (%s) after %d ms: %s",
+                     dev, dir, type, waited, waited < 0 ? "no such disk" : rc == 0 ? "ok" : strerror(errno));
+            klog(msg);
+        }
+        free(fstab);
+    }
+    if (g_kmsg_fd >= 0) { close(g_kmsg_fd); g_kmsg_fd = -1; }
+    umount2("/sys", MNT_DETACH);
+    umount2("/dev", MNT_DETACH);
+}
+
 int main(int argc, char** argv) {
+    // Android 8 to 9 init re-executes /init (this program) once SELinux policy is loaded:
+    // with INIT_SECOND_STAGE=true on 8.x, with --second-stage on 9. The supervisor and
+    // early mount already ran: hand over.
+    // On those images /sbin/ueventd and /sbin/watchdogd are symlinks to /init too.
+    const char* base = strrchr(argv[0], '/');
+    base = base ? base + 1 : argv[0];
+    const char* second = getenv("INIT_SECOND_STAGE");
+    if (strcmp(base, "init") != 0 || (second && strcmp(second, "true") == 0)) {
+        execv("/init.stock", argv);
+        return 1;
+    }
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--second-stage") == 0) {
+            execv("/init.stock", argv);
+            return 1;
+        }
+    }
+    if (getpid() == 1 && access("/whpx_legacy_mount", F_OK) == 0) legacy_premount();
+    // Android 10's first-stage init does not load /lib/modules (11 does; loading twice is harmless).
+    else if (getpid() == 1 && access("/whpx_load_modules", F_OK) == 0) legacy_load_modules();
     pid_t pid = fork();
     if (pid == 0) {
         // Child daemon: supervisor

@@ -27,6 +27,15 @@ Run stock Android system images on Windows 11 ARM64 from Android Studio. System 
 4. `whpx_init` bind-mounts the patched files over `/vendor` when the property service appears, and starts `gfx_forwarder`.
 5. After boot, the bridge pushes the input daemon, network agent and guest scripts through adb.
 
+### Android 8 to 11
+
+These images ship one gzip ramdisk instead of LZ4 segments, and the bridge treats any image like that as legacy (`isLegacyImage`). They boot `kernel_p7_legacy`, made from `kernel_p7_permissive` by `image-tools/make_legacy_kernel.py`: their linker does not know the vDSO's `DT_AARCH64_BTI_PLT` tag and printed a warning in every process, which broke Android Studio's installer. Their init reads `androidboot.*` from the kernel command line, not bootconfig, so the bridge copies the bootconfig settings there, with `qemu.gles=1` and `qemu.uirenderer=skiagl`.
+
+- Android 8 and 9 (`prepare_legacy_ramdisk`): the ramdisk is the whole root filesystem, and early mount comes from fstab entries Google's emulator puts in the device tree. `whpx_init`, as PID 1, loads the virtio modules and mounts `system` and `vendor` itself (`legacy_premount`: tmpfs `/dev` and nodes made from sysfs, because the kernel has no devtmpfs; Android 9's `system.img` is system-as-root and is bound from `/system_root/system`). It then hands over to the stock init, also when that init re-executes `/init` for its second stage. The fstabs are rewritten for the bridge's disk order, and `init.ranchu.rc` gains binderfs (the kernel has no `/dev/binder`), adb, and media and storage properties. On Android 9 the vendor `fstab.ranchu` and `handheld_core_hardware.xml` (without the ethernet feature, which made EthernetService take `eth0` over) are replaced through the overlay.
+- Android 10 and 11 (`prepare_firststage_ramdisk`): the ramdisk holds only first-stage init, which mounts the logical partitions from the `super` partition of `system.img` as newer images do. Android 10's init loads no modules, so `whpx_init` does. `whpx_init` mounts binderfs on Android 10, keeps media off ION (no ION in this kernel), and on Android 9 and 10 replaces the sdcard daemon, which needs sdcardfs, with a stand-in that bind-mounts `/data/media`.
+- `gfx_autopatch.py --legacy-pipes` retargets `open("/dev/qemu_pipe")` and `open("/dev/goldfish_pipe")`, as these clients have no vsock fallback to find. The sensors, fingerprint and RIL clients are left unpatched (the host answers none of them) and Android 8's Trusty keymaster is disabled, so the software keymaster is used.
+- `/data` comes from the image's ~600 MB `userdata.img`, grown to 10 GB on the host the first time.
+
 ## Vendor patching
 
 Stock images expect goldfish devices that QEMU does not provide here.

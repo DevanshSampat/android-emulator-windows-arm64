@@ -62,7 +62,7 @@ def _hash_file(h, path):
             h.update(chunk)
 
 
-def build_gfx_overlay(sys_dir, bridge_dir):
+def build_gfx_overlay(sys_dir, bridge_dir, legacy=False):
     """Return [(vendor_rel_path, bytes)] replacing stock vendor binaries.
 
     Universal: the stock files come from this image's own vendor.img and are
@@ -75,7 +75,7 @@ def build_gfx_overlay(sys_dir, bridge_dir):
     if not os.path.isfile(vendor_img):
         print('[prepare_whpx_initrd] no vendor.img; graphics overlay skipped')
         return []
-    h = hashlib.sha256(b'gfx-overlay-v%d' % GFX_OVERLAY_VERSION)
+    h = hashlib.sha256(b'gfx-overlay-v%d' % GFX_OVERLAY_VERSION + (b'-legacy-pipes' if legacy else b''))
     for src in ('vendor_extract.py', 'gfx_autopatch.py'):
         _hash_file(h, os.path.join(bridge_dir, src))
     st = os.stat(vendor_img)
@@ -91,7 +91,7 @@ def build_gfx_overlay(sys_dir, bridge_dir):
         os.makedirs(stock)
         py = sys.executable or 'python'
         for cmd in ([py, os.path.join(bridge_dir, 'vendor_extract.py'), vendor_img, stock],
-                    [py, os.path.join(bridge_dir, 'gfx_autopatch.py'), stock, out]):
+                    [py, os.path.join(bridge_dir, 'gfx_autopatch.py'), stock, out] + (['--legacy-pipes'] if legacy else [])):
             r = subprocess.run(cmd, capture_output=True, text=True)
             sys.stdout.write(r.stdout)
             if r.returncode not in (0, 1):
@@ -132,11 +132,12 @@ def build_gfx_overlay(sys_dir, bridge_dir):
     return result
 
 
-def gfx_overlay_segment(sys_dir, bridge_dir):
+def gfx_overlay_segment(sys_dir, bridge_dir, legacy=False, extra=()):
     """Third initramfs segment: /whpx_gfx/{manifest,<idx>,gfx_forwarder},
-    consumed by whpx_init (see apply_gfx_overlay)."""
+    consumed by whpx_init (see apply_gfx_overlay). `extra` adds other vendor
+    files [(vendor_rel_path, bytes)] to replace the same way."""
     try:
-        files = build_gfx_overlay(sys_dir, bridge_dir)
+        files = build_gfx_overlay(sys_dir, bridge_dir, legacy) + list(extra)
     except Exception as e:
         print(f'[prepare_whpx_initrd] graphics overlay failed: {e}')
         return b''
@@ -161,14 +162,284 @@ def gfx_overlay_segment(sys_dir, bridge_dir):
     return lz4_legacy_segment(bytes(cp))
 
 
+def parse_newc(cpio):
+    """[(name, mode, data)] of a newc cpio archive, in order."""
+    out, o = [], 0
+    while o + 110 <= len(cpio):
+        h = cpio[o:o + 110]
+        if h[:6] not in (b'070701', b'070702'):
+            break
+        f = [int(h[6 + i * 8:14 + i * 8], 16) for i in range(13)]
+        mode, size, nsize = f[1], f[6], f[11]
+        name = cpio[o + 110:o + 110 + nsize - 1].decode('utf-8', 'replace')
+        o = (o + 110 + nsize + 3) & ~3
+        data = cpio[o:o + size]
+        o = (o + size + 3) & ~3
+        if name == 'TRAILER!!!':
+            break
+        out.append((name, mode, data))
+    return out
+
+
+# Disks as the bridge attaches them: system vda, vendor vdb, userdata vdc,
+# encryptionkey vdd, cache vde. Android 8 to 9 fstabs expect Google's order
+# (system vda, cache vdb, userdata vdc, vendor vdd, sdcard vde).
+LEGACY_DISKS = {'/system': '/dev/block/vda', '/vendor': '/dev/block/vdb',
+                '/data': '/dev/block/vdc', '/cache': '/dev/block/vde'}
+
+LEGACY_RC = b"""
+# Added by the WHPX emulator.
+# The kernels only offer binder through binderfs, which Android 11+ init mounts
+# itself; these images expect /dev/binder, /dev/hwbinder and /dev/vndbinder.
+on early-init
+    mkdir /dev/binderfs 0755 root root
+    mount binder binder /dev/binderfs stats=global
+    chmod 0755 /dev/binderfs
+    symlink /dev/binderfs/binder /dev/binder
+    symlink /dev/binderfs/hwbinder /dev/hwbinder
+    symlink /dev/binderfs/vndbinder /dev/vndbinder
+    chmod 0666 /dev/binderfs/binder
+    chmod 0666 /dev/binderfs/hwbinder
+    chmod 0666 /dev/binderfs/vndbinder
+
+on post-fs-data
+    # The kernels have no sdcardfs; Android 8's sdcard daemon then uses FUSE.
+    setprop persist.sys.sdcardfs force_off
+    # Android 9's vendor build.prop (loaded after early-init) switches media to Codec2,
+    # which allocates from ION; these kernels have none, and every codec start crashed
+    # its caller (system_server, SystemUI).
+    setprop debug.stagefright.ccodec 0
+
+on boot
+    setprop service.adb.tcp.port 5555
+    setprop persist.sys.usb.config adb
+    start adbd
+
+on property:sys.boot_completed=1
+    start adbd
+
+# There is no Wi-Fi hardware; on Android 8.0 wificond crashes and is restarted every 5 s.
+on property:init.svc.wificond=restarting
+    stop wificond
+"""
+
+MODULES_5_15_LOAD = b"virtio_blk.ko\nvirtio_console.ko\nvirtio_mmio.ko\nvirtio_pci_modern_dev.ko\nvirtio_pci.ko\nvirtio-rng.ko\nfailover.ko\nnet_failover.ko\nvirtio_net.ko\n"
+
+
+def _legacy_fstab(data):
+    """Point each partition at the disk the bridge attaches for it; drop the sdcard.
+    /data loses forceencrypt/encryptable: the AVD's userdata starts blank, and
+    full-disk encryption of it at first boot is slow and needs a crypto footer."""
+    lines = []
+    for raw in data.decode('utf-8', 'replace').splitlines():
+        parts = raw.split()
+        if len(parts) >= 2 and not raw.lstrip().startswith('#'):
+            if 'voldmanaged=' in raw:
+                continue
+            if parts[1] in LEGACY_DISKS:
+                raw = raw.replace(parts[0], LEGACY_DISKS[parts[1]], 1)
+            if parts[1] == '/data' and len(parts) >= 5:
+                flags = [f for f in parts[4].split(',')
+                         if not f.startswith(('forceencrypt=', 'encryptable=', 'forcefdeorfbe='))]
+                raw = raw.replace(parts[4], ','.join(flags), 1)
+        lines.append(raw)
+    return ('\n'.join(lines) + '\n').encode()
+
+
+# Android 9 keeps its early-mount fstab only in Google's device tree.
+LEGACY_EARLY_FSTAB = b"/dev/block/vda  /system  ext4  ro  wait\n/dev/block/vdb  /vendor  ext4  ro  wait\n"
+
+
+def _vendor_file(sys_dir, rel):
+    """A file from the image's vendor.img, or None."""
+    try:
+        import vendor_extract
+        fs = vendor_extract.open_fs(os.path.join(sys_dir, 'vendor.img'))
+        nid = fs.root
+        for part in rel.split('/'):
+            nid = dict(fs.listdir(nid))[part]
+        return fs.data(nid)
+    except Exception:
+        return None
+
+
+def prepare_legacy_ramdisk(orig, sys_dir, avd_dir, out_base):
+    """Android 8 to 9: one gzip ramdisk holding the whole root filesystem, with
+    early mount from the device tree. whpx_init does the early mount instead
+    (see legacy_premount in whpx_init.c), so the ramdisk gets whpx_init as
+    /init, the virtio modules, fstabs that match the bridge's disks, and adb.
+    Output: one LZ4 segment plus the graphics overlay segment."""
+    import gzip
+    entries = parse_newc(gzip.decompress(orig))
+    bridge_dir = os.path.dirname(os.path.abspath(__file__))
+    whpx_init_bin = open(os.path.join(bridge_dir, 'whpx_init'), 'rb').read()
+    adbkey_path = os.path.join(os.path.expanduser('~'), '.android', 'adbkey.pub')
+    adb_keys = open(adbkey_path, 'rb').read().strip() + b'\n' if os.path.isfile(adbkey_path) else b''
+    cp, ino = bytearray(), 1000
+
+    def add(name, mode, data):
+        nonlocal ino
+        cp.extend(make_cpio_entry(ino, mode, name, data))
+        ino += 1
+
+    names = {e[0] for e in entries}
+    if 'init.rc' not in names:
+        return prepare_firststage_ramdisk(entries, sys_dir, out_base, whpx_init_bin, adb_keys)
+    for name, mode, data in entries:
+        if name == 'init':
+            add('init.stock', mode, data)
+            add('init', 0o100755, whpx_init_bin)
+            continue
+        if name in ('fstab.ranchu', 'fstab.ranchu.early'):
+            data = _legacy_fstab(data)
+        elif name == 'init.ranchu.rc':
+            data = data.rstrip(b'\n') + b'\n' + LEGACY_RC
+        add(name, mode, data)
+    if 'fstab.ranchu.early' not in names:
+        add('fstab.ranchu.early', 0o100640, LEGACY_EARLY_FSTAB)
+    if 'init.ranchu.rc' not in names:  # Android 9: init.rc still imports /init.${ro.hardware}.rc
+        add('init.ranchu.rc', 0o100750, LEGACY_RC)
+    # Android 9 keeps fstab.ranchu in vendor: the overlay replaces it with the remapped one.
+    extra = []
+    vfstab = _vendor_file(sys_dir, 'etc/fstab.ranchu')
+    if vfstab:
+        extra.append(('etc/fstab.ranchu', _legacy_fstab(vfstab)))
+    # Android 9 declares ethernet inside handheld_core_hardware.xml (whpx_init only hides the
+    # separate feature files). With it, EthernetService takes eth0 over: netd drops 10.0.2.15
+    # and destroys every socket on it, the graphics connections included.
+    for name in ('handheld_core_hardware.xml', 'tablet_core_hardware.xml'):
+        perm = _vendor_file(sys_dir, 'etc/permissions/' + name)
+        if perm and (b'android.hardware.ethernet' in perm or b'android.hardware.usb.host' in perm):
+            kept = [l for l in perm.split(b'\n')
+                    if b'android.hardware.ethernet' not in l and b'android.hardware.usb.host' not in l]
+            extra.append(('etc/permissions/' + name, b'\n'.join(kept)))
+    add('whpx_legacy_mount', 0o100644, b'')
+    if adb_keys:
+        add('adb_keys', 0o100644, adb_keys)
+    modules_dir = os.path.join(bridge_dir, 'modules_whpx_5_15')
+    add('lib', 0o040755, b'')
+    add('lib/modules', 0o040755, b'')
+    for m in MODULES_5_15_LOAD.decode().split():
+        add('lib/modules/' + m, 0o100644, open(os.path.join(modules_dir, m), 'rb').read())
+    add('lib/modules/modules.load', 0o100644, MODULES_5_15_LOAD)
+    add('TRAILER!!!', 0, b'')
+    while len(cp) % 512:
+        cp.append(0)
+    base = lz4_legacy_segment(bytes(cp)) + gfx_overlay_segment(sys_dir, bridge_dir, legacy=True, extra=extra)
+    with open(out_base, 'wb') as f:
+        f.write(base)
+    print(f"[prepare_whpx_initrd] Built Android 8-9 ramdisk with early mount: {len(base)} bytes")
+    return True
+
+
+MODULES_5_15_DEP = (b"/lib/modules/virtio_mmio.ko:\n/lib/modules/virtio-rng.ko:\n/lib/modules/virtio_blk.ko:\n"
+                    b"/lib/modules/virtio_console.ko:\n/lib/modules/virtio_pci.ko: /lib/modules/virtio_pci_modern_dev.ko\n"
+                    b"/lib/modules/virtio_pci_modern_dev.ko:\n/lib/modules/failover.ko:\n"
+                    b"/lib/modules/net_failover.ko: /lib/modules/failover.ko\n"
+                    b"/lib/modules/virtio_net.ko: /lib/modules/net_failover.ko /lib/modules/failover.ko\n")
+MODULES_5_15_ALIAS = (b"alias virtio:d00000004v* virtio_rng\nalias virtio:d00000002v* virtio_blk\n"
+                      b"alias virtio:d00000003v* virtio_console\nalias pci:v00001AF4d*sv*sd*bc*sc*i* virtio_pci\n"
+                      b"alias virtio:d00000001v* virtio_net\n")
+
+
+def _firststage_fstab(data):
+    """Android 10 to 11 first-stage fstab: the logical partitions come from the
+    "super" partition of system.img, found by name (androidboot.boot_devices) as on
+    newer images. /metadata goes to the disk the bridge attaches for it (vdd), /data
+    to vdc, the sdcard is dropped."""
+    lines = []
+    for raw in data.decode('utf-8', 'replace').splitlines():
+        parts = raw.split()
+        if len(parts) >= 5 and not raw.lstrip().startswith('#'):
+            if 'voldmanaged=' in raw:
+                continue
+            if parts[1] == '/metadata':
+                raw = '/dev/block/vdd    /metadata    ext4    noatime,nosuid,nodev    wait,formattable,first_stage_mount'
+            elif parts[1] == '/data':
+                raw = raw.replace(parts[0], '/dev/block/vdc', 1)
+        lines.append(raw)
+    return ('\n'.join(lines) + '\n').encode()
+
+
+def _legacy_audio(sys_dir):
+    """The goldfish audio HAL plays through ALSA, and there is no sound card: on Android
+    10 audioserver then found no primary output and aborted every few seconds. The
+    image's AOSP stub HAL (accepts audio, discards it) goes in under goldfish's name."""
+    out = []
+    for lib in ('lib64', 'lib'):
+        stub = _vendor_file(sys_dir, lib + '/hw/audio.primary.default.so')
+        if stub and _vendor_file(sys_dir, lib + '/hw/audio.primary.goldfish.so'):
+            out.append((lib + '/hw/audio.primary.goldfish.so', stub))
+    return out
+
+
+def prepare_firststage_ramdisk(entries, sys_dir, out_base, whpx_init_bin, adb_keys):
+    """Android 10 to 11: one gzip ramdisk with only first-stage init (and, on 10, its
+    fstab). That init mounts the logical partitions from system.img's "super" itself
+    and loads /lib/modules, as on newer images, so no early mount is needed: whpx_init
+    goes in front of it, plus the 5.15 virtio modules, an fstab for the bridge's disks
+    (Android 11 keeps it in vendor only) and adb keys."""
+    bridge_dir = os.path.dirname(os.path.abspath(__file__))
+    names = {e[0] for e in entries}
+    cp, ino = bytearray(), 1000
+
+    def add(name, mode, data):
+        nonlocal ino
+        cp.extend(make_cpio_entry(ino, mode, name, data))
+        ino += 1
+
+    vfstab = _vendor_file(sys_dir, 'etc/fstab.ranchu')
+    for name, mode, data in entries:
+        if name == 'init':
+            add('init.stock', mode, data)
+            add('init', 0o100755, whpx_init_bin)
+            continue
+        if name == 'fstab.ranchu':
+            data = _firststage_fstab(data)
+        add(name, mode, data)
+    if 'fstab.ranchu' not in names and vfstab:
+        first = [l for l in vfstab.decode('utf-8', 'replace').splitlines() if 'first_stage_mount' in l]
+        add('fstab.ranchu', 0o100640, _firststage_fstab(('\n'.join(first) + '\n').encode()))
+    if adb_keys:
+        add('adb_keys', 0o100644, adb_keys)
+    add('force_debuggable', 0o100644, b'')
+    add('whpx_load_modules', 0o100644, b'')  # whpx_init loads them (Android 10's init does not)
+    modules_dir = os.path.join(bridge_dir, 'modules_whpx_5_15')
+    if 'lib' not in names:
+        add('lib', 0o040755, b'')
+    add('lib/modules', 0o040755, b'')
+    for m in MODULES_5_15_LOAD.decode().split():
+        add('lib/modules/' + m, 0o100644, open(os.path.join(modules_dir, m), 'rb').read())
+    add('lib/modules/modules.load', 0o100644, MODULES_5_15_LOAD)
+    add('lib/modules/modules.dep', 0o100644, MODULES_5_15_DEP)
+    add('lib/modules/modules.alias', 0o100644, MODULES_5_15_ALIAS)
+    add('TRAILER!!!', 0, b'')
+    while len(cp) % 512:
+        cp.append(0)
+    extra = [('etc/fstab.ranchu', _firststage_fstab(vfstab))] if vfstab else []
+    extra += _legacy_audio(sys_dir)
+    base = lz4_legacy_segment(bytes(cp)) + gfx_overlay_segment(sys_dir, bridge_dir, legacy=True, extra=extra)
+    with open(out_base, 'wb') as f:
+        f.write(base)
+    print(f"[prepare_whpx_initrd] Built Android 10-11 first-stage ramdisk: {len(base)} bytes")
+    return True
+
+
 def prepare_ramdisk_base(sys_dir, avd_dir):
     ramdisk_src = os.path.join(sys_dir, 'ramdisk.img')
     out_base = os.path.join(avd_dir, 'initrd_whpx_base')
     if not os.path.exists(ramdisk_src):
         return False
-    
+
     with open(ramdisk_src, 'rb') as f:
         orig = f.read()
+
+    if orig[:2] == b'\x1f\x8b':
+        try:
+            return prepare_legacy_ramdisk(orig, sys_dir, avd_dir, out_base)
+        except Exception as e:
+            print(f"[prepare_whpx_initrd] Android 8-9 ramdisk failed: {e}")
+            return False
 
     seg2_idx = orig.find(b'\x02\x21\x4c\x18', 4)
     if seg2_idx == -1:

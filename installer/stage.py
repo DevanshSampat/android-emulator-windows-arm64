@@ -49,7 +49,7 @@ files = """GfxstreamPipeServer.exe GfxstreamPipeServer.x64.exe WhpxLauncher.exe
 prepare_whpx_initrd.py vendor_extract.py gfx_autopatch.py auto_minute_maid.py
 start_android_ui.sh whpx_loop.sh run_input_daemon.sh run_net_agent.sh
 default_net_agent.jar set_wallpaper.jar whpx_input.jar framework_patched.jar
-gfx_forwarder whpx_daemon whpx_init kernel_p7_permissive kernel_whpx_universal kernel_whpx_stimer
+gfx_forwarder whpx_daemon whpx_init kernel_p7_permissive kernel_p7_legacy kernel_whpx_universal kernel_whpx_stimer
 ramdisk_whpx_base.img boot_payload.tar mapper3.so default_wallpaper.png
 aapm.xml empty_perm.xml handheld_core_hardware.xml""".split()
 for f in files:
